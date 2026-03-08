@@ -27,6 +27,7 @@ pub enum EventType {
     BuildSuccess,
     BuildFail,
     ErrorEncountered,
+    ClaudeSession,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

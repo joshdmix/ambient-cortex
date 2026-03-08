@@ -107,6 +107,7 @@ pub fn serialize_event_type(et: &EventType) -> String {
         EventType::BuildSuccess => "build_success".to_string(),
         EventType::BuildFail => "build_fail".to_string(),
         EventType::ErrorEncountered => "error_encountered".to_string(),
+        EventType::ClaudeSession => "claude_session".to_string(),
     }
 }
 
@@ -123,6 +124,7 @@ pub fn deserialize_event_type(s: &str) -> EventType {
         "build_success" => EventType::BuildSuccess,
         "build_fail" => EventType::BuildFail,
         "error_encountered" => EventType::ErrorEncountered,
+        "claude_session" => EventType::ClaudeSession,
         _ => EventType::FileSave, // fallback
     }
 }
