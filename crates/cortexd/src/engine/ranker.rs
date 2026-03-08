@@ -22,6 +22,35 @@ impl InsightRanker {
         score.clamp(0.0, 1.0)
     }
 
+    /// Score an insight including an optional semantic similarity factor.
+    /// When similarity is provided, it is blended into the score, reducing
+    /// the weight of other factors proportionally.
+    pub fn score_with_similarity(
+        &self,
+        insight: &Insight,
+        occurrence_count: u64,
+        similarity: Option<f64>,
+    ) -> f64 {
+        let recency = self.recency_score(&insight.created_at);
+        let severity = self.severity_score(insight);
+        let frequency = self.frequency_score(occurrence_count);
+
+        match similarity {
+            Some(sim) => {
+                let sim_clamped = sim.clamp(0.0, 1.0);
+                // With similarity: recency 0.3, severity 0.3, frequency 0.15, similarity 0.25
+                let score =
+                    recency * 0.3 + severity * 0.3 + frequency * 0.15 + sim_clamped * 0.25;
+                score.clamp(0.0, 1.0)
+            }
+            None => {
+                // Fall back to original weights when no similarity available
+                let score = recency * 0.4 + severity * 0.4 + frequency * 0.2;
+                score.clamp(0.0, 1.0)
+            }
+        }
+    }
+
     /// Returns true if the insight passes the relevance threshold.
     pub fn passes_threshold(&self, relevance: f64) -> bool {
         relevance >= self.threshold

@@ -1,3 +1,4 @@
+pub mod embeddings;
 pub mod migrations;
 pub mod models;
 pub mod store;
@@ -6,10 +7,11 @@ use anyhow::Result;
 use chrono::Utc;
 use cortex_common::events::{CortexEvent, EventType};
 use cortex_common::models::{Insight, RelationType};
-use cortex_common::protocol::{EventSummary, FileInfo, InsightSummary};
+use cortex_common::protocol::{EventSummary, FileInfo, InsightSummary, SearchHit, SessionSummary};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use self::embeddings::EmbeddingEngine;
 use self::models::{serialize_event_type, serialize_source};
 use self::store::Store;
 
@@ -20,6 +22,8 @@ pub struct KnowledgeGraph {
     store: Mutex<Store>,
     /// Recent file edit events for co-edit tracking: (file_path, timestamp_epoch)
     recent_edits: Mutex<VecDeque<(String, i64)>>,
+    /// Optional embedding engine for semantic search
+    embedding_engine: Mutex<Option<EmbeddingEngine>>,
 }
 
 impl KnowledgeGraph {
@@ -27,12 +31,48 @@ impl KnowledgeGraph {
         Self {
             store: Mutex::new(store),
             recent_edits: Mutex::new(VecDeque::with_capacity(100)),
+            embedding_engine: Mutex::new(None),
         }
+    }
+
+    pub fn init_embeddings(&self) -> Result<()> {
+        let mut engine = self.embedding_engine.lock().unwrap();
+        if engine.is_none() {
+            tracing::info!("initializing embedding engine...");
+            match EmbeddingEngine::new() {
+                Ok(e) => {
+                    *engine = Some(e);
+                    tracing::info!("embedding engine initialized successfully");
+                }
+                Err(e) => {
+                    tracing::warn!("failed to initialize embedding engine: {}", e);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn ingest_event(&self, event: &CortexEvent) -> Result<()> {
         let store = self.store.lock().unwrap();
         let event_id = store.insert_event(event)?;
+
+        // Generate and store embedding for the event summary
+        let summary_text = format_event_summary(event);
+        let engine = self.embedding_engine.lock().unwrap();
+        if let Some(ref eng) = *engine {
+            match eng.embed(&summary_text) {
+                Ok(vector) => {
+                    if let Err(e) = store.insert_embedding("event", event_id, &vector, &summary_text) {
+                        tracing::warn!("failed to store embedding: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("failed to generate embedding: {}", e);
+                }
+            }
+        }
+        drop(engine);
 
         // Update file node if this event has a file path
         if let Some(ref file_path) = event.file_path {
@@ -193,6 +233,44 @@ impl KnowledgeGraph {
     pub fn get_events_for_file(&self, path: &str, limit: usize) -> Result<Vec<CortexEvent>> {
         let store = self.store.lock().unwrap();
         store.get_events_for_file(path, limit)
+    }
+
+    pub fn semantic_search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let engine = self.embedding_engine.lock().unwrap();
+        let eng = match engine.as_ref() {
+            Some(e) => e,
+            None => return Ok(Vec::new()),
+        };
+
+        let query_vector = eng.embed(query)?;
+        drop(engine);
+
+        let store = self.store.lock().unwrap();
+        let results = store.search_embeddings(&query_vector, limit)?;
+
+        Ok(results
+            .into_iter()
+            .map(|(_id, source_type, text, similarity)| SearchHit {
+                text,
+                source_type,
+                relevance: similarity as f64,
+            })
+            .collect())
+    }
+
+    pub fn dismiss_insight(&self, id: i64) -> Result<()> {
+        let store = self.store.lock().unwrap();
+        store.dismiss_insight(id)
+    }
+
+    pub fn upvote_insight(&self, id: i64) -> Result<()> {
+        let store = self.store.lock().unwrap();
+        store.upvote_insight(id)
+    }
+
+    pub fn get_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>> {
+        let store = self.store.lock().unwrap();
+        store.get_sessions(limit)
     }
 }
 

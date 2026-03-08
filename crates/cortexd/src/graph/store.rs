@@ -1,9 +1,12 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use cortex_common::events::CortexEvent;
 use cortex_common::models::{FileNode, Insight, RelationType};
+use cortex_common::protocol::SessionSummary;
 use rusqlite::{params, Connection};
 use std::path::Path;
 
+use super::embeddings::EmbeddingEngine;
 use super::migrations;
 use super::models::{
     event_from_row, file_node_from_row, insight_from_row, serialize_event_type,
@@ -232,5 +235,120 @@ impl Store {
             .collect();
 
         Ok(events)
+    }
+
+    pub fn dismiss_insight(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE insights SET dismissed = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn upvote_insight(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE insights SET relevance = MIN(relevance + 0.1, 1.0), surfaced = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_insight_surfaced(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE insights SET surfaced = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_embedding(
+        &self,
+        source_type: &str,
+        source_id: i64,
+        vector: &[f32],
+        text: &str,
+    ) -> Result<()> {
+        let vector_bytes: Vec<u8> = vector
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        self.conn.execute(
+            "INSERT INTO embeddings (source_type, source_id, vector, text) VALUES (?1, ?2, ?3, ?4)",
+            params![source_type, source_id, vector_bytes, text],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn search_embeddings(
+        &self,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(i64, String, String, f32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_type, vector, text FROM embeddings",
+        )?;
+
+        let mut results: Vec<(i64, String, String, f32)> = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let source_type: String = row.get(1)?;
+                let vector_bytes: Vec<u8> = row.get(2)?;
+                let text: String = row.get(3)?;
+                Ok((id, source_type, vector_bytes, text))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(id, source_type, vector_bytes, text)| {
+                let stored_vector: Vec<f32> = vector_bytes
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect();
+                let similarity = EmbeddingEngine::cosine_similarity(query_vector, &stored_vector);
+                (id, source_type, text, similarity)
+            })
+            .collect();
+
+        results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+
+        Ok(results)
+    }
+
+    pub fn get_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, MIN(timestamp) as start_time, MAX(timestamp) as end_time, COUNT(*) as event_count
+             FROM events
+             WHERE session_id IS NOT NULL
+             GROUP BY session_id
+             ORDER BY start_time DESC
+             LIMIT ?1",
+        )?;
+
+        let sessions = stmt
+            .query_map(params![limit as i64], |row| {
+                let session_id: String = row.get(0)?;
+                let start_str: String = row.get(1)?;
+                let end_str: String = row.get(2)?;
+                let event_count: i64 = row.get(3)?;
+                Ok((session_id, start_str, end_str, event_count))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(session_id, start_str, end_str, event_count)| {
+                let start_time: DateTime<Utc> =
+                    start_str.parse().unwrap_or_else(|_| Utc::now());
+                let end_time: DateTime<Utc> =
+                    end_str.parse().unwrap_or_else(|_| Utc::now());
+                SessionSummary {
+                    session_id,
+                    start_time,
+                    end_time,
+                    event_count: event_count as u64,
+                    summary: format!("{} events", event_count),
+                }
+            })
+            .collect();
+
+        Ok(sessions)
     }
 }

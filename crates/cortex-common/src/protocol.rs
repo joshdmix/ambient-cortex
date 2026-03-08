@@ -8,6 +8,10 @@ pub enum Request {
     Query { file_path: String },
     History { limit: usize },
     Search { query: String },
+    DismissInsight { insight_id: i64 },
+    UpvoteInsight { insight_id: i64 },
+    GetInsights,
+    GetSessions { limit: usize },
     Shutdown,
 }
 
@@ -18,6 +22,8 @@ pub enum Response {
     QueryResult(FileInfo),
     HistoryResult(Vec<EventSummary>),
     SearchResult(Vec<SearchHit>),
+    InsightsResult(Vec<InsightSummary>),
+    SessionsResult(Vec<SessionSummary>),
     Error(String),
     Ok,
 }
@@ -62,4 +68,13 @@ pub struct SearchHit {
     pub text: String,
     pub source_type: String,
     pub relevance: f64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub start_time: DateTime<Utc>,
+    pub end_time: DateTime<Utc>,
+    pub event_count: u64,
+    pub summary: String,
 }

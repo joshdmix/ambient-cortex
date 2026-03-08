@@ -1,5 +1,5 @@
-use chrono::Utc;
-use cortex_common::events::CortexEvent;
+use chrono::{Duration, Utc};
+use cortex_common::events::{CortexEvent, EventType};
 use cortex_common::models::{Insight, InsightType};
 use std::sync::Arc;
 
@@ -26,6 +26,18 @@ impl LocalRules {
         }
 
         if let Some(insight) = self.context_switch(event, graph) {
+            insights.push(insight);
+        }
+
+        if let Some(insight) = self.edit_revert_detector(event, graph) {
+            insights.push(insight);
+        }
+
+        if let Some(insight) = self.error_pattern(event, graph) {
+            insights.push(insight);
+        }
+
+        if let Some(insight) = self.long_debug_cycle(event, graph) {
             insights.push(insight);
         }
 
@@ -158,6 +170,189 @@ impl LocalRules {
 
         None
     }
+
+    /// Detect rapid file saves suggesting an iterative debug cycle.
+    /// If the same file has >3 saves within 5 minutes, generate a warning.
+    fn edit_revert_detector(
+        &self,
+        event: &CortexEvent,
+        graph: &Arc<KnowledgeGraph>,
+    ) -> Option<Insight> {
+        if !matches!(event.event_type, EventType::FileSave) {
+            return None;
+        }
+
+        let file_path = event.file_path.as_ref()?;
+        let file_events = graph.get_events_for_file(file_path, 20).ok()?;
+
+        let five_min_ago = Utc::now() - Duration::minutes(5);
+
+        let save_count = file_events
+            .iter()
+            .filter(|e| {
+                matches!(e.event_type, EventType::FileSave) && e.timestamp > five_min_ago
+            })
+            .count();
+
+        if save_count <= 3 {
+            return None;
+        }
+
+        let title = "Rapid file saves detected".to_string();
+        let body = format!(
+            "You've saved {} {} times in 5 minutes — possible debug cycle.",
+            file_path, save_count
+        );
+
+        Some(Insight {
+            id: None,
+            created_at: Utc::now(),
+            trigger_event: event.id,
+            insight_type: InsightType::Warning,
+            title,
+            body,
+            relevance: 0.75,
+            surfaced: false,
+            dismissed: false,
+            file_path: Some(file_path.clone()),
+            project: event.project.clone(),
+        })
+    }
+
+    /// Detect repeated command failures of the same type.
+    /// If the same command prefix has failed >2 times in the last 30 minutes, generate a warning.
+    fn error_pattern(
+        &self,
+        event: &CortexEvent,
+        graph: &Arc<KnowledgeGraph>,
+    ) -> Option<Insight> {
+        if !matches!(event.event_type, EventType::CommandFail) {
+            return None;
+        }
+
+        // Extract command prefix from the current event's payload
+        let cmd = event
+            .payload
+            .get("cmd")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let cmd_prefix = extract_command_prefix(cmd);
+        if cmd_prefix.is_empty() {
+            return None;
+        }
+
+        let thirty_min_ago = Utc::now() - Duration::minutes(30);
+
+        // Use EventSummary-based recent events to find similar failures
+        let recent = graph.get_recent_events(100).ok()?;
+
+        let fail_count = recent
+            .iter()
+            .filter(|e| {
+                e.event_type == "command_fail"
+                    && e.timestamp > thirty_min_ago
+                    && e.summary.contains(&cmd_prefix)
+            })
+            .count();
+
+        if fail_count <= 2 {
+            return None;
+        }
+
+        let title = "Repeated command failures".to_string();
+        let body = format!(
+            "This command has failed {} times recently. Consider checking: [files from recent git commits].",
+            fail_count
+        );
+
+        Some(Insight {
+            id: None,
+            created_at: Utc::now(),
+            trigger_event: event.id,
+            insight_type: InsightType::Warning,
+            title,
+            body,
+            relevance: 0.85,
+            surfaced: false,
+            dismissed: false,
+            file_path: event.file_path.clone(),
+            project: event.project.clone(),
+        })
+    }
+
+    /// Detect long debug cycles: same file saved >5 times in 10 minutes with
+    /// interspersed CommandFail events.
+    fn long_debug_cycle(
+        &self,
+        event: &CortexEvent,
+        graph: &Arc<KnowledgeGraph>,
+    ) -> Option<Insight> {
+        if !matches!(event.event_type, EventType::FileSave) {
+            return None;
+        }
+
+        let file_path = event.file_path.as_ref()?;
+        let file_events = graph.get_events_for_file(file_path, 50).ok()?;
+
+        let ten_min_ago = Utc::now() - Duration::minutes(10);
+
+        let recent_saves: Vec<&CortexEvent> = file_events
+            .iter()
+            .filter(|e| {
+                matches!(e.event_type, EventType::FileSave) && e.timestamp > ten_min_ago
+            })
+            .collect();
+
+        if recent_saves.len() <= 5 {
+            return None;
+        }
+
+        // Check for interspersed CommandFail events in the same timeframe
+        let recent_summaries = graph.get_recent_events(100).ok()?;
+        let fail_count = recent_summaries
+            .iter()
+            .filter(|e| e.event_type == "command_fail" && e.timestamp > ten_min_ago)
+            .count();
+
+        if fail_count == 0 {
+            return None;
+        }
+
+        // Calculate duration from earliest recent save to now
+        let earliest = recent_saves
+            .last()
+            .map(|e| e.timestamp)
+            .unwrap_or_else(Utc::now);
+        let duration_secs = (Utc::now() - earliest).num_seconds();
+
+        let title = "Long debug cycle detected".to_string();
+        let body = format!(
+            "You've been iterating on {} for {} with failures. Consider stepping back to review the approach.",
+            file_path,
+            format_duration(duration_secs)
+        );
+
+        Some(Insight {
+            id: None,
+            created_at: Utc::now(),
+            trigger_event: event.id,
+            insight_type: InsightType::Warning,
+            title,
+            body,
+            relevance: 0.9,
+            surfaced: false,
+            dismissed: false,
+            file_path: Some(file_path.clone()),
+            project: event.project.clone(),
+        })
+    }
+}
+
+/// Extract the command prefix (first two words, e.g. "cargo build", "npm test").
+fn extract_command_prefix(cmd: &str) -> String {
+    let parts: Vec<&str> = cmd.split_whitespace().take(2).collect();
+    parts.join(" ")
 }
 
 fn format_duration(seconds: i64) -> String {

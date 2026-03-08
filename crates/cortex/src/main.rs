@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
         Command::History { limit } => history::run(limit).await?,
         Command::Search { query } => search::run(&query).await?,
         Command::Install => install::run()?,
-        Command::Tui => tui::run(),
+        Command::Tui => tui::run().await?,
         Command::Config { action } => match action {
             Some(ConfigAction::Edit) => config::edit()?,
             None => config::show()?,

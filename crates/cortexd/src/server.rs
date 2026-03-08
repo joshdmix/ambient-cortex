@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cortex_common::protocol::{DaemonStatus, Request, Response};
+use cortex_common::protocol::{DaemonStatus, InsightSummary, Request, Response};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -119,10 +119,37 @@ fn handle_request(
             Ok(events) => Response::HistoryResult(events),
             Err(e) => Response::Error(format!("history error: {}", e)),
         },
-        Request::Search { query: _ } => {
-            // Phase 2: semantic search
-            Response::SearchResult(Vec::new())
-        }
+        Request::Search { query } => match graph.semantic_search(&query, 20) {
+            Ok(hits) => Response::SearchResult(hits),
+            Err(e) => Response::Error(format!("search error: {}", e)),
+        },
+        Request::DismissInsight { insight_id } => match graph.dismiss_insight(insight_id) {
+            Ok(()) => Response::Ok,
+            Err(e) => Response::Error(format!("dismiss error: {}", e)),
+        },
+        Request::UpvoteInsight { insight_id } => match graph.upvote_insight(insight_id) {
+            Ok(()) => Response::Ok,
+            Err(e) => Response::Error(format!("upvote error: {}", e)),
+        },
+        Request::GetInsights => match graph.get_pending_insights() {
+            Ok(insights) => {
+                let summaries: Vec<InsightSummary> = insights
+                    .iter()
+                    .map(|i| InsightSummary {
+                        title: i.title.clone(),
+                        body: i.body.clone(),
+                        relevance: i.relevance,
+                        insight_type: crate::graph::models::serialize_insight_type(&i.insight_type),
+                    })
+                    .collect();
+                Response::InsightsResult(summaries)
+            }
+            Err(e) => Response::Error(format!("insights error: {}", e)),
+        },
+        Request::GetSessions { limit } => match graph.get_sessions(limit) {
+            Ok(sessions) => Response::SessionsResult(sessions),
+            Err(e) => Response::Error(format!("sessions error: {}", e)),
+        },
         Request::Shutdown => {
             tracing::info!("shutdown requested via socket");
             Response::Ok

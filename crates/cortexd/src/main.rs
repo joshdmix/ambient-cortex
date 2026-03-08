@@ -44,6 +44,15 @@ async fn main() -> Result<()> {
     // Create the knowledge graph
     let graph = Arc::new(KnowledgeGraph::new(store));
 
+    // Initialize embeddings engine (heavy model load, do it async)
+    let embed_graph = graph.clone();
+    tokio::spawn(async move {
+        match embed_graph.init_embeddings() {
+            Ok(()) => tracing::info!("embedding engine initialized"),
+            Err(e) => tracing::warn!("embedding engine unavailable: {}", e),
+        }
+    });
+
     // Create event bus
     let bus = EventBus::new(1024);
 
@@ -51,8 +60,17 @@ async fn main() -> Result<()> {
     let engine_rx = bus.subscribe();
     let engine_graph = graph.clone();
     let insight_threshold = config.insight_threshold;
+    let claude_enabled = config.claude_enabled;
+    let claude_api_key = config.claude_api_key.clone();
+    let claude_max_calls = config.claude_max_calls_per_hour;
     let engine_handle = tokio::spawn(async move {
-        let engine = engine::InferenceEngine::new(engine_graph, insight_threshold);
+        let mut engine = engine::InferenceEngine::new(engine_graph, insight_threshold);
+        if claude_enabled {
+            if let Some(api_key) = claude_api_key {
+                engine = engine.with_claude(api_key, claude_max_calls);
+                tracing::info!("claude API enabled for inference");
+            }
+        }
         if let Err(e) = engine.run(engine_rx).await {
             tracing::error!("inference engine error: {}", e);
         }
