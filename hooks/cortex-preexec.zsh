@@ -45,3 +45,4 @@ __cortex_prompt() {
 autoload -Uz add-zsh-hook
 add-zsh-hook preexec __cortex_preexec
 add-zsh-hook precmd __cortex_precmd
+add-zsh-hook precmd __cortex_prompt

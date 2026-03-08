@@ -2,6 +2,7 @@ mod bus;
 mod config;
 mod engine;
 mod graph;
+mod insight_writer;
 mod server;
 mod watchers;
 
@@ -88,6 +89,12 @@ async fn main() -> Result<()> {
     watcher_manager.start_all(config.clone(), bus.clone())?;
     let watcher_manager = Arc::new(std::sync::Mutex::new(watcher_manager));
 
+    // Start insight writer (writes current_insight.json for shell prompt)
+    let insight_graph = graph.clone();
+    let insight_handle = tokio::spawn(async move {
+        insight_writer::run(insight_graph).await;
+    });
+
     // Shutdown signal
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -137,6 +144,7 @@ async fn main() -> Result<()> {
     engine_handle.abort();
     ingest_handle.abort();
     server_handle.abort();
+    insight_handle.abort();
 
     tracing::info!("cortexd shut down cleanly");
     Ok(())
