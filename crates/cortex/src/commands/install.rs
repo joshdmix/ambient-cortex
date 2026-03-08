@@ -87,6 +87,41 @@ add-zsh-hook precmd cortex_precmd
         .with_context(|| format!("failed to write shell hook: {}", hook_path.display()))?;
     println!("  Shell hook written to {}", hook_path.display());
 
+    // Create bash hook script
+    let bash_hook_path = config_dir.join("shell-hook.bash");
+    let bash_hook_script = r#"# Cortex shell hook — source this in your .bashrc
+# Sends terminal events to the cortex daemon via named pipe
+
+_cortex_pipe="$HOME/.local/share/cortex/terminal.pipe"
+_cortex_cmd=""
+_cortex_start=""
+
+cortex_preexec() {
+    _cortex_cmd="$1"
+    _cortex_start=$SECONDS
+    if [[ -p "$_cortex_pipe" ]]; then
+        printf '{"event_type":"command_run","source":"terminal","payload":{"cmd":"%s","pwd":"%s"}}\n' \
+            "${_cortex_cmd//\"/\\\"}" "$PWD" > "$_cortex_pipe" 2>/dev/null
+    fi
+}
+
+cortex_precmd() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]] && [[ -p "$_cortex_pipe" ]]; then
+        printf '{"event_type":"command_fail","source":"terminal","payload":{"exit_code":%d,"pwd":"%s"}}\n' \
+            "$exit_code" "$PWD" > "$_cortex_pipe" 2>/dev/null
+    fi
+    _cortex_cmd=""
+}
+
+# Use DEBUG trap for preexec equivalent
+trap 'cortex_preexec "$BASH_COMMAND"' DEBUG
+PROMPT_COMMAND="cortex_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+"#;
+    fs::write(&bash_hook_path, bash_hook_script)
+        .with_context(|| format!("failed to write bash hook: {}", bash_hook_path.display()))?;
+    println!("  Bash hook written to {}", bash_hook_path.display());
+
     // Install git hooks in repos found under watch_dirs
     println!("\nInstalling git hooks...");
     let watch_dirs = cortexd_config_watch_dirs();
@@ -99,13 +134,73 @@ add-zsh-hook precmd cortex_precmd
         }
     }
 
+    // Generate launchd plist for macOS daemon management
+    #[cfg(target_os = "macos")]
+    {
+        let launch_agents_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Library/LaunchAgents");
+        fs::create_dir_all(&launch_agents_dir)?;
+
+        let cortexd_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("cortexd")))
+            .unwrap_or_else(|| PathBuf::from("/usr/local/bin/cortexd"));
+
+        let plist_path = launch_agents_dir.join("com.ambient-cortex.cortexd.plist");
+        let log_dir = data_dir.clone();
+        let plist_content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ambient-cortex.cortexd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{}/cortexd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>{}/cortexd.err.log</string>
+</dict>
+</plist>"#,
+            cortexd_path.display(),
+            log_dir.display(),
+            log_dir.display()
+        );
+
+        fs::write(&plist_path, plist_content)
+            .with_context(|| format!("failed to write launchd plist: {}", plist_path.display()))?;
+        println!("  Launchd plist written to {}", plist_path.display());
+    }
+
     // Print setup instructions
     println!("\nInstallation complete!\n");
-    println!("To activate the shell hook, add this line to your ~/.zshrc:\n");
+    println!("To activate the shell hook, add one of these to your shell config:\n");
+    println!("  # zsh (~/.zshrc)");
     println!("  source \"{}\"", hook_path.display());
     println!();
-    println!("Then start the daemon:");
-    println!("  cortexd &");
+    println!("  # bash (~/.bashrc)");
+    println!("  source \"{}\"", bash_hook_path.display());
+    println!();
+    println!("Then start the daemon:\n");
+    #[cfg(target_os = "macos")]
+    {
+        println!("  # auto-start on login (recommended)");
+        println!("  launchctl load ~/Library/LaunchAgents/com.ambient-cortex.cortexd.plist\n");
+        println!("  # or run manually");
+        println!("  cortexd &");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!("  cortexd &");
+    }
     println!();
 
     Ok(())
@@ -167,7 +262,7 @@ fn install_git_hooks(repo_path: &PathBuf) -> Result<()> {
         fs::create_dir_all(&hooks_dir)?;
     }
 
-    let pipe_path = "${XDG_RUNTIME_DIR:-/tmp}/cortex/git.pipe";
+    let pipe_path = "$HOME/.local/share/cortex/git.pipe";
 
     // Post-commit hook
     let post_commit_path = hooks_dir.join("post-commit");

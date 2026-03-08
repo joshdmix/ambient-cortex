@@ -440,7 +440,39 @@ impl LocalRules {
                 saves.push((file_path.clone(), now));
                 // Keep only last 5 minutes of saves
                 saves.retain(|(_, ts)| now - ts < 300);
-                None
+                drop(saves);
+
+                // Check if we should suggest a predicted command for this file
+                let pairs = self.action_pairs.lock().unwrap();
+                let best = pairs
+                    .iter()
+                    .filter(|((f, _), count)| f == file_path && **count > 5)
+                    .max_by_key(|(_, count)| *count);
+
+                match best {
+                    Some(((_, cmd), count)) => {
+                        let title = "Predicted next action".to_string();
+                        let body = format!(
+                            "You usually run '{}' after editing {} ({} times observed)",
+                            cmd, file_path, count
+                        );
+
+                        Some(Insight {
+                            id: None,
+                            created_at: Utc::now(),
+                            trigger_event: event.id,
+                            insight_type: InsightType::Suggestion,
+                            title,
+                            body,
+                            relevance: 0.7,
+                            surfaced: false,
+                            dismissed: false,
+                            file_path: Some(file_path.clone()),
+                            project: event.project.clone(),
+                        })
+                    }
+                    None => None,
+                }
             }
             EventType::CommandRun => {
                 // Check if there was a recent file save, and record the pair
@@ -472,46 +504,7 @@ impl LocalRules {
 
                 None
             }
-            _ => {
-                // For file saves, check if we should suggest a command
-                if !matches!(event.event_type, EventType::FileSave) {
-                    return None;
-                }
-
-                let file_path = event.file_path.as_ref()?;
-                let pairs = self.action_pairs.lock().unwrap();
-
-                // Find the strongest pair for this file
-                let best = pairs
-                    .iter()
-                    .filter(|((f, _), count)| f == file_path && **count > 5)
-                    .max_by_key(|(_, count)| *count);
-
-                match best {
-                    Some(((_, cmd), count)) => {
-                        let title = "Predicted next action".to_string();
-                        let body = format!(
-                            "You usually run '{}' after editing {} ({} times observed)",
-                            cmd, file_path, count
-                        );
-
-                        Some(Insight {
-                            id: None,
-                            created_at: Utc::now(),
-                            trigger_event: event.id,
-                            insight_type: InsightType::Suggestion,
-                            title,
-                            body,
-                            relevance: 0.7,
-                            surfaced: false,
-                            dismissed: false,
-                            file_path: Some(file_path.clone()),
-                            project: event.project.clone(),
-                        })
-                    }
-                    None => None,
-                }
-            }
+            _ => None,
         }
     }
 
@@ -909,6 +902,60 @@ mod tests {
             count >= 6,
             "Expected action pair count >= 6, got {}",
             count
+        );
+        drop(pairs);
+
+        // Now a new FileSave should generate a predictive insight
+        let save = make_event(EventType::FileSave, Some("/src/lib.rs"), Some("proj"));
+        let insights = rules.evaluate(&save, &graph);
+        assert!(
+            insights
+                .iter()
+                .any(|i| i.title.contains("Predicted next action")),
+            "Expected predictive action insight after >5 pairs, got: {:?}",
+            insights.iter().map(|i| &i.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn long_debug_cycle() {
+        let graph = make_graph();
+        let rules = LocalRules::new();
+
+        // Insert >5 FileSave events for same file within 10 minutes
+        for i in 0..6 {
+            let evt = make_event_at(
+                EventType::FileSave,
+                Some("/src/tricky.rs"),
+                Some("proj"),
+                Utc::now() - Duration::seconds(60 * (5 - i)),
+            );
+            graph.ingest_event(&evt).unwrap();
+        }
+
+        // Insert interspersed CommandFail events
+        for i in 0..2 {
+            let mut evt = make_event_at(
+                EventType::CommandFail,
+                None,
+                Some("proj"),
+                Utc::now() - Duration::seconds(60 * (4 - i)),
+            );
+            evt.payload = serde_json::json!({"cmd": "cargo test", "exit_code": 1});
+            graph.ingest_event(&evt).unwrap();
+        }
+
+        // Trigger with another FileSave
+        let trigger = make_event(EventType::FileSave, Some("/src/tricky.rs"), Some("proj"));
+        graph.ingest_event(&trigger).unwrap();
+
+        let insights = rules.evaluate(&trigger, &graph);
+        assert!(
+            insights
+                .iter()
+                .any(|i| i.title.contains("Long debug cycle")),
+            "Expected long debug cycle insight, got: {:?}",
+            insights.iter().map(|i| &i.title).collect::<Vec<_>>()
         );
     }
 

@@ -301,6 +301,19 @@ impl KnowledgeGraph {
             .collect())
     }
 
+    /// Compute cosine similarity between two text strings using embeddings.
+    /// Returns an error if embeddings are unavailable.
+    pub fn compute_similarity(&self, text_a: &str, text_b: &str) -> Result<f32> {
+        let engine = self.embedding_engine.lock().unwrap();
+        let eng = engine
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("embedding engine not initialized"))?;
+
+        let texts = vec![text_a.to_string(), text_b.to_string()];
+        let vectors = eng.embed_batch(&texts)?;
+        Ok(EmbeddingEngine::cosine_similarity(&vectors[0], &vectors[1]))
+    }
+
     pub fn export_data(&self) -> Result<String> {
         let store = self.store.lock().unwrap();
         let events = store.get_recent_events(100_000)?;

@@ -95,7 +95,9 @@ impl InferenceEngine {
 
         // Score and store qualifying insights
         for mut insight in insights {
-            let score = self.ranker.score(&insight, 1);
+            // Try to compute semantic similarity if embeddings are available
+            let similarity = self.compute_similarity(event, &insight);
+            let score = self.ranker.score_with_similarity(&insight, 1, similarity);
             insight.relevance = score;
 
             if self.ranker.passes_threshold(score) {
@@ -249,6 +251,22 @@ impl InferenceEngine {
         }
 
         Ok(())
+    }
+
+    /// Compute semantic similarity between the event context and the insight.
+    /// Returns None if embeddings are unavailable.
+    fn compute_similarity(&self, event: &CortexEvent, insight: &cortex_common::models::Insight) -> Option<f64> {
+        let event_text = format!(
+            "{:?} {}",
+            event.event_type,
+            event.file_path.as_deref().unwrap_or("")
+        );
+        let insight_text = &insight.body;
+
+        match self.graph.compute_similarity(&event_text, insight_text) {
+            Ok(sim) => Some(sim as f64),
+            Err(_) => None,
+        }
     }
 
     /// Detect session gaps >30 minutes and rotate the session.
