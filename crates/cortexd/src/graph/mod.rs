@@ -7,7 +7,7 @@ use anyhow::Result;
 use chrono::Utc;
 use cortex_common::events::{CortexEvent, EventType};
 use cortex_common::models::{Insight, RelationType};
-use cortex_common::protocol::{EventSummary, FileInfo, InsightSummary, SearchHit, SessionSummary};
+use cortex_common::protocol::{EventSummary, FileInfo, InsightSummary, RelatedFileEntry, SearchHit, SessionSummary};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
@@ -284,6 +284,78 @@ impl KnowledgeGraph {
         let embeddings_pruned = store.prune_orphaned_embeddings()?;
         Ok((events_pruned, embeddings_pruned))
     }
+
+    pub fn get_related_files_detailed(&self, path: &str) -> Result<Vec<RelatedFileEntry>> {
+        let store = self.store.lock().unwrap();
+        let related = store.get_related_files(path)?;
+        Ok(related
+            .into_iter()
+            .map(|(p, rel, strength)| {
+                let relation = models::serialize_relation_type(&rel);
+                RelatedFileEntry {
+                    path: p,
+                    relation,
+                    strength,
+                }
+            })
+            .collect())
+    }
+
+    pub fn export_data(&self) -> Result<String> {
+        let store = self.store.lock().unwrap();
+        let events = store.get_recent_events(100_000)?;
+        let insights = store.get_pending_insights()?;
+
+        let export = serde_json::json!({
+            "version": 1,
+            "exported_at": Utc::now().to_rfc3339(),
+            "events": events.iter().map(|e| serde_json::json!({
+                "timestamp": e.timestamp,
+                "event_type": models::serialize_event_type(&e.event_type),
+                "source": models::serialize_source(&e.source),
+                "project": e.project,
+                "file_path": e.file_path,
+                "payload": e.payload,
+                "session_id": e.session_id,
+            })).collect::<Vec<_>>(),
+            "insights": insights.iter().map(|i| serde_json::json!({
+                "created_at": i.created_at,
+                "insight_type": models::serialize_insight_type(&i.insight_type),
+                "title": i.title,
+                "body": i.body,
+                "relevance": i.relevance,
+                "file_path": i.file_path,
+                "project": i.project,
+            })).collect::<Vec<_>>(),
+        });
+
+        Ok(serde_json::to_string_pretty(&export)?)
+    }
+
+    pub fn import_data(&self, data: &str) -> Result<(usize, usize)> {
+        let parsed: serde_json::Value = serde_json::from_str(data)?;
+        let store = self.store.lock().unwrap();
+
+        let mut event_count = 0;
+        if let Some(events) = parsed.get("events").and_then(|v| v.as_array()) {
+            for evt_val in events {
+                let event: CortexEvent = serde_json::from_value(evt_val.clone())?;
+                store.insert_event(&event)?;
+                event_count += 1;
+            }
+        }
+
+        let mut insight_count = 0;
+        if let Some(insights) = parsed.get("insights").and_then(|v| v.as_array()) {
+            for ins_val in insights {
+                let insight: cortex_common::models::Insight = serde_json::from_value(ins_val.clone())?;
+                store.insert_insight(&insight)?;
+                insight_count += 1;
+            }
+        }
+
+        Ok((event_count, insight_count))
+    }
 }
 
 fn format_event_summary(event: &CortexEvent) -> String {
@@ -320,6 +392,14 @@ fn format_event_summary(event: &CortexEvent) -> String {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             format!("checked out: {}", branch)
+        }
+        EventType::ClaudeSession => {
+            let duration = event
+                .payload
+                .get("duration_secs")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            format!("claude code session ({}m)", duration / 60)
         }
         _ => serialize_event_type(&event.event_type),
     }

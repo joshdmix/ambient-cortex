@@ -16,7 +16,9 @@ use ratatui::{
     Terminal,
 };
 
-use cortex_common::protocol::{DaemonStatus, EventSummary, InsightSummary, Request, Response};
+use cortex_common::protocol::{
+    DaemonStatus, EventSummary, InsightSummary, RelatedFileEntry, Request, Response,
+};
 
 use super::send_request;
 
@@ -24,16 +26,20 @@ use super::send_request;
 enum Panel {
     Activity,
     Insights,
+    Graph,
 }
 
 struct App {
     status: Option<DaemonStatus>,
     events: Vec<EventSummary>,
     insights: Vec<InsightSummary>,
+    graph_data: Vec<RelatedFileEntry>,
+    graph_file: Option<String>,
     daemon_error: Option<String>,
 
     activity_state: ListState,
     insight_state: ListState,
+    graph_state: ListState,
     focused_panel: Panel,
     should_quit: bool,
 }
@@ -46,9 +52,12 @@ impl App {
             status: None,
             events: Vec::new(),
             insights: Vec::new(),
+            graph_data: Vec::new(),
+            graph_file: None,
             daemon_error: None,
             activity_state,
             insight_state: ListState::default(),
+            graph_state: ListState::default(),
             focused_panel: Panel::Activity,
             should_quit: false,
         }
@@ -105,6 +114,12 @@ impl App {
                     self.insight_state.select(Some(i - 1));
                 }
             }
+            Panel::Graph => {
+                let i = self.graph_state.selected().unwrap_or(0);
+                if i > 0 {
+                    self.graph_state.select(Some(i - 1));
+                }
+            }
         }
     }
 
@@ -124,6 +139,13 @@ impl App {
                     self.insight_state.select(Some(i + 1));
                 }
             }
+            Panel::Graph => {
+                let max = self.graph_data.len().saturating_sub(1);
+                let i = self.graph_state.selected().unwrap_or(0);
+                if i < max {
+                    self.graph_state.select(Some(i + 1));
+                }
+            }
         }
     }
 
@@ -136,6 +158,9 @@ impl App {
                 }
             }
             Panel::Insights => {
+                self.focused_panel = Panel::Activity;
+            }
+            Panel::Graph => {
                 self.focused_panel = Panel::Activity;
             }
         }
@@ -154,6 +179,40 @@ impl App {
                 }
             }
         }
+    }
+
+    async fn toggle_graph(&mut self) {
+        if self.focused_panel == Panel::Graph {
+            self.focused_panel = Panel::Activity;
+            return;
+        }
+
+        // Get the file path from the selected event's summary
+        if let Some(evt) = self.selected_event() {
+            // Try to extract a file path from the summary
+            let file_path = extract_file_from_summary(&evt.summary);
+            if let Some(path) = file_path {
+                match send_request(Request::GetRelatedFiles {
+                    file_path: path.clone(),
+                })
+                .await
+                {
+                    Ok(Response::RelatedFilesResult(entries)) => {
+                        self.graph_data = entries;
+                        self.graph_file = Some(path);
+                        if !self.graph_data.is_empty() {
+                            self.graph_state.select(Some(0));
+                        }
+                    }
+                    _ => {
+                        self.graph_data.clear();
+                        self.graph_file = Some(path);
+                    }
+                }
+            }
+        }
+
+        self.focused_panel = Panel::Graph;
     }
 
     fn selected_event(&self) -> Option<&EventSummary> {
@@ -199,6 +258,7 @@ pub async fn run() -> Result<()> {
                         KeyCode::Tab => app.toggle_panel(),
                         KeyCode::Char('d') => app.dismiss_insight(),
                         KeyCode::Char('r') => app.refresh_data().await,
+                        KeyCode::Char('g') => app.toggle_graph().await,
                         _ => {}
                     }
                 }
@@ -314,13 +374,23 @@ fn render_top_bar(f: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn render_body(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(area);
+    if app.focused_panel == Panel::Graph {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(area);
 
-    render_activity_stream(f, chunks[0], app);
-    render_right_panel(f, chunks[1], app);
+        render_activity_stream(f, chunks[0], app);
+        render_graph(f, chunks[1], app);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area);
+
+        render_activity_stream(f, chunks[0], app);
+        render_right_panel(f, chunks[1], app);
+    }
 }
 
 fn event_type_color(event_type: &str) -> Color {
@@ -494,6 +564,95 @@ fn render_quick_info(f: &mut ratatui::Frame, area: Rect, app: &App) {
     f.render_widget(paragraph, area);
 }
 
+fn render_graph(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let border_style = Style::default().fg(Color::Cyan);
+
+    let title = match &app.graph_file {
+        Some(path) => {
+            let short = path.rsplit('/').next().unwrap_or(path);
+            format!(" File Graph: {} ({}) ", short, app.graph_data.len())
+        }
+        None => " File Graph ".to_string(),
+    };
+
+    if app.graph_data.is_empty() {
+        let msg = if app.graph_file.is_some() {
+            "No related files found for this file."
+        } else {
+            "Select an event and press 'g' to view file relationships."
+        };
+        let paragraph = Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray)))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(border_style),
+            );
+        f.render_widget(paragraph, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .graph_data
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let connector = if i == app.graph_data.len() - 1 {
+                "\u{2514}\u{2500}\u{2500}"
+            } else {
+                "\u{251c}\u{2500}\u{2500}"
+            };
+            let short_path = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{} ", connector),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("{:^14}", entry.relation),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("({:.1}) ", entry.strength),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(short_path, Style::default().fg(Color::White)),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(border_style),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+
+    f.render_stateful_widget(list, area, &mut app.graph_state);
+}
+
+fn extract_file_from_summary(summary: &str) -> Option<String> {
+    // Try to extract file path from summaries like "saved /path/to/file"
+    if let Some(path) = summary.strip_prefix("saved ") {
+        return Some(path.to_string());
+    }
+    // Check for paths with common extensions
+    for word in summary.split_whitespace() {
+        if word.contains('/') && (word.contains('.') || word.ends_with('/')) {
+            return Some(word.to_string());
+        }
+    }
+    None
+}
+
 fn render_bottom_bar(f: &mut ratatui::Frame, area: Rect) {
     let help = Line::from(vec![
         Span::styled(" q", Style::default().fg(Color::Yellow).bold()),
@@ -509,7 +668,9 @@ fn render_bottom_bar(f: &mut ratatui::Frame, area: Rect) {
         Span::styled("d", Style::default().fg(Color::Yellow).bold()),
         Span::styled(" dismiss insight  ", Style::default().fg(Color::Gray)),
         Span::styled("r", Style::default().fg(Color::Yellow).bold()),
-        Span::styled(" refresh", Style::default().fg(Color::Gray)),
+        Span::styled(" refresh  ", Style::default().fg(Color::Gray)),
+        Span::styled("g", Style::default().fg(Color::Yellow).bold()),
+        Span::styled(" graph", Style::default().fg(Color::Gray)),
     ]);
 
     let bar = Paragraph::new(help).block(Block::default().borders(Borders::ALL));

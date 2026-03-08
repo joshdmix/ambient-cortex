@@ -150,6 +150,20 @@ fn handle_request(
             Ok(sessions) => Response::SessionsResult(sessions),
             Err(e) => Response::Error(format!("sessions error: {}", e)),
         },
+        Request::GetRelatedFiles { file_path } => {
+            match graph.get_related_files_detailed(&file_path) {
+                Ok(entries) => Response::RelatedFilesResult(entries),
+                Err(e) => Response::Error(format!("related files error: {}", e)),
+            }
+        }
+        Request::Export => match graph.export_data() {
+            Ok(data) => Response::ExportResult(data),
+            Err(e) => Response::Error(format!("export error: {}", e)),
+        },
+        Request::Import { data } => match graph.import_data(&data) {
+            Ok(_) => Response::Ok,
+            Err(e) => Response::Error(format!("import error: {}", e)),
+        },
         Request::Shutdown => {
             tracing::info!("shutdown requested via socket");
             Response::Ok

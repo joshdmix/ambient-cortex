@@ -12,6 +12,9 @@ pub enum Request {
     UpvoteInsight { insight_id: i64 },
     GetInsights,
     GetSessions { limit: usize },
+    GetRelatedFiles { file_path: String },
+    Export,
+    Import { data: String },
     Shutdown,
 }
 
@@ -24,8 +27,17 @@ pub enum Response {
     SearchResult(Vec<SearchHit>),
     InsightsResult(Vec<InsightSummary>),
     SessionsResult(Vec<SessionSummary>),
+    RelatedFilesResult(Vec<RelatedFileEntry>),
+    ExportResult(String),
     Error(String),
     Ok,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RelatedFileEntry {
+    pub path: String,
+    pub relation: String,
+    pub strength: f64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
