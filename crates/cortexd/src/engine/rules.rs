@@ -41,6 +41,10 @@ impl LocalRules {
             insights.push(insight);
         }
 
+        if let Some(insight) = self.stale_branch(event, graph) {
+            insights.push(insight);
+        }
+
         insights
     }
 
@@ -277,6 +281,60 @@ impl LocalRules {
             surfaced: false,
             dismissed: false,
             file_path: event.file_path.clone(),
+            project: event.project.clone(),
+        })
+    }
+
+    /// When checking out a branch, warn if it was last active >7 days ago.
+    fn stale_branch(
+        &self,
+        event: &CortexEvent,
+        graph: &Arc<KnowledgeGraph>,
+    ) -> Option<Insight> {
+        if !matches!(event.event_type, EventType::GitCheckout) {
+            return None;
+        }
+
+        let branch = event
+            .payload
+            .get("branch")
+            .and_then(|v| v.as_str())?;
+
+        // Look through recent events for past activity on this branch
+        let recent = graph.get_recent_events(500).ok()?;
+
+        let seven_days_ago = Utc::now() - Duration::days(7);
+
+        // Find the most recent event mentioning this branch (excluding the current checkout)
+        let last_branch_event = recent
+            .iter()
+            .skip(1) // skip the current event
+            .find(|e| e.summary.contains(branch));
+
+        let last_activity = match last_branch_event {
+            Some(evt) if evt.timestamp < seven_days_ago => evt,
+            _ => return None,
+        };
+
+        let days_ago = (Utc::now() - last_activity.timestamp).num_days();
+
+        let title = format!("Stale branch: {}", branch);
+        let body = format!(
+            "This branch was last active {} days ago. Previous activity: {}",
+            days_ago, last_activity.summary
+        );
+
+        Some(Insight {
+            id: None,
+            created_at: Utc::now(),
+            trigger_event: event.id,
+            insight_type: InsightType::Reminder,
+            title,
+            body,
+            relevance: 0.75,
+            surfaced: false,
+            dismissed: false,
+            file_path: None,
             project: event.project.clone(),
         })
     }
