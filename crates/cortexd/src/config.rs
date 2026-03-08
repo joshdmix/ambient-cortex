@@ -19,6 +19,8 @@ pub struct CortexConfig {
     pub insight_threshold: f64,
     #[serde(default = "default_debounce")]
     pub debounce_ms: u64,
+    #[serde(default)]
+    pub notifications_enabled: bool,
 }
 
 fn default_watch_dirs() -> Vec<PathBuf> {
@@ -53,6 +55,7 @@ impl Default for CortexConfig {
             claude_max_calls_per_hour: default_max_calls(),
             insight_threshold: default_threshold(),
             debounce_ms: default_debounce(),
+            notifications_enabled: false,
         }
     }
 }

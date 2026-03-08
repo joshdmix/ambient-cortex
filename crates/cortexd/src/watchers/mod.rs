@@ -51,8 +51,14 @@ impl WatcherManager {
         });
         self.handles.push(("git", git_handle));
 
-        // Editor watcher (stub)
-        editor::run();
+        // Editor watcher
+        let editor_bus = bus.clone();
+        let editor_handle = tokio::spawn(async move {
+            if let Err(e) = editor::run(editor_bus).await {
+                tracing::error!("editor watcher error: {}", e);
+            }
+        });
+        self.handles.push(("editor", editor_handle));
 
         tracing::info!("all watchers started");
         Ok(())

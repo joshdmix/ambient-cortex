@@ -351,4 +351,21 @@ impl Store {
 
         Ok(sessions)
     }
+
+    pub fn prune_old_events(&self, retention_days: u64) -> Result<u64> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
+        let deleted = self.conn.execute(
+            "DELETE FROM events WHERE timestamp < ?1",
+            params![cutoff],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    pub fn prune_orphaned_embeddings(&self) -> Result<u64> {
+        let deleted = self.conn.execute(
+            "DELETE FROM embeddings WHERE source_type = 'event' AND source_id NOT IN (SELECT id FROM events)",
+            [],
+        )?;
+        Ok(deleted as u64)
+    }
 }

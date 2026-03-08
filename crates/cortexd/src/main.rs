@@ -3,6 +3,7 @@ mod config;
 mod engine;
 mod graph;
 mod insight_writer;
+mod notifier;
 mod server;
 mod watchers;
 
@@ -44,6 +45,35 @@ async fn main() -> Result<()> {
 
     // Create the knowledge graph
     let graph = Arc::new(KnowledgeGraph::new(store));
+
+    // Prune old data on startup
+    let retention_days = config.retention_days;
+    match graph.prune(retention_days) {
+        Ok((events, embeddings)) => {
+            if events > 0 || embeddings > 0 {
+                tracing::info!("pruned {} events, {} embeddings (retention: {} days)", events, embeddings, retention_days);
+            }
+        }
+        Err(e) => tracing::warn!("pruning failed: {}", e),
+    }
+
+    // Daily pruning task
+    let prune_graph = graph.clone();
+    let prune_retention = config.retention_days;
+    let prune_handle = tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(86400);
+        loop {
+            tokio::time::sleep(interval).await;
+            match prune_graph.prune(prune_retention) {
+                Ok((events, embeddings)) => {
+                    if events > 0 || embeddings > 0 {
+                        tracing::info!("daily prune: {} events, {} embeddings", events, embeddings);
+                    }
+                }
+                Err(e) => tracing::warn!("daily pruning failed: {}", e),
+            }
+        }
+    });
 
     // Initialize embeddings engine (heavy model load, do it async)
     let embed_graph = graph.clone();
@@ -93,6 +123,13 @@ async fn main() -> Result<()> {
     let insight_graph = graph.clone();
     let insight_handle = tokio::spawn(async move {
         insight_writer::run(insight_graph).await;
+    });
+
+    // Start notifier (macOS notifications for high-relevance insights)
+    let notifier_graph = graph.clone();
+    let notifications_enabled = config.notifications_enabled;
+    let notifier_handle = tokio::spawn(async move {
+        notifier::run(notifier_graph, notifications_enabled).await;
     });
 
     // Shutdown signal
@@ -145,6 +182,8 @@ async fn main() -> Result<()> {
     ingest_handle.abort();
     server_handle.abort();
     insight_handle.abort();
+    prune_handle.abort();
+    notifier_handle.abort();
 
     tracing::info!("cortexd shut down cleanly");
     Ok(())

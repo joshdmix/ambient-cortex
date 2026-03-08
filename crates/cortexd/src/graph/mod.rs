@@ -258,6 +258,11 @@ impl KnowledgeGraph {
             .collect())
     }
 
+    pub fn mark_insight_surfaced(&self, id: i64) -> Result<()> {
+        let store = self.store.lock().unwrap();
+        store.mark_insight_surfaced(id)
+    }
+
     pub fn dismiss_insight(&self, id: i64) -> Result<()> {
         let store = self.store.lock().unwrap();
         store.dismiss_insight(id)
@@ -271,6 +276,13 @@ impl KnowledgeGraph {
     pub fn get_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>> {
         let store = self.store.lock().unwrap();
         store.get_sessions(limit)
+    }
+
+    pub fn prune(&self, retention_days: u64) -> Result<(u64, u64)> {
+        let store = self.store.lock().unwrap();
+        let events_pruned = store.prune_old_events(retention_days)?;
+        let embeddings_pruned = store.prune_orphaned_embeddings()?;
+        Ok((events_pruned, embeddings_pruned))
     }
 }
 
