@@ -4,6 +4,7 @@ use cortex_common::events::{CortexEvent, EventSource, EventType};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::io::AsyncBufReadExt;
 
 use crate::bus::EventBus;
 use crate::config::CortexConfig;
@@ -21,11 +22,9 @@ fn find_git_repos(dirs: &[PathBuf]) -> Vec<PathBuf> {
         if !dir.exists() {
             continue;
         }
-        // Check if this dir itself is a git repo
         if dir.join(".git").exists() {
             repos.push(dir.clone());
         }
-        // Check immediate subdirectories
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -39,7 +38,10 @@ fn find_git_repos(dirs: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 fn get_head_info(repo: &git2::Repository) -> (Option<git2::Oid>, Option<String>) {
-    let oid = repo.head().ok().map(|r| r.target().unwrap_or_else(|| git2::Oid::zero()));
+    let oid = repo
+        .head()
+        .ok()
+        .map(|r| r.target().unwrap_or_else(|| git2::Oid::zero()));
     let branch = repo
         .head()
         .ok()
@@ -47,18 +49,111 @@ fn get_head_info(repo: &git2::Repository) -> (Option<git2::Oid>, Option<String>)
     (oid, branch)
 }
 
+/// Dual-mode git watcher: named pipe for hook-based events + polling fallback.
 pub async fn run(config: Arc<CortexConfig>, bus: EventBus) -> Result<()> {
+    let pipe_bus = bus.clone();
+    let poll_bus = bus;
+    let poll_config = config;
+
+    // Spawn pipe listener for hook-based events
+    tokio::spawn(async move {
+        if let Err(e) = run_pipe_listener(pipe_bus).await {
+            tracing::error!("git pipe listener error: {}", e);
+        }
+    });
+
+    // Run polling fallback
+    run_polling(poll_config, poll_bus).await
+}
+
+/// Listen on named pipe for git hook events (post-commit, post-checkout).
+async fn run_pipe_listener(bus: EventBus) -> Result<()> {
+    let pipe_path = CortexConfig::pipe_path("git.pipe");
+
+    if let Some(parent) = pipe_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    #[cfg(unix)]
+    if !pipe_path.exists() {
+        use std::process::Command;
+        let _ = Command::new("mkfifo").arg(&pipe_path).status();
+    }
+
+    tracing::info!("git pipe listener on {}", pipe_path.display());
+
+    loop {
+        let file = match tokio::fs::File::open(&pipe_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("failed to open git pipe: {}, retrying in 1s", e);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        let reader = tokio::io::BufReader::new(file);
+        let mut lines = reader.lines();
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(payload) => {
+                    let event_type_str = payload
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    let event_type = match event_type_str {
+                        "git_commit" => EventType::GitCommit,
+                        "git_checkout" => EventType::GitCheckout,
+                        _ => continue,
+                    };
+
+                    let branch = payload
+                        .get("branch")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    let event = CortexEvent {
+                        id: None,
+                        timestamp: Utc::now(),
+                        event_type,
+                        source: EventSource::Git,
+                        project: branch.clone(),
+                        file_path: None,
+                        payload: payload.clone(),
+                        session_id: None,
+                    };
+
+                    bus.publish(event);
+                    tracing::debug!("git pipe event: {}", event_type_str);
+                }
+                Err(e) => {
+                    tracing::warn!("failed to parse git pipe event: {}", e);
+                }
+            }
+        }
+
+        tracing::debug!("git pipe writer disconnected, reopening");
+    }
+}
+
+/// Polling fallback: check git repos every 5 seconds for changes.
+async fn run_polling(config: Arc<CortexConfig>, bus: EventBus) -> Result<()> {
     let repos = find_git_repos(&config.watch_dirs);
     if repos.is_empty() {
         tracing::info!("no git repos found to watch");
         return Ok(());
     }
 
-    tracing::info!("git watcher monitoring {} repos", repos.len());
+    tracing::info!("git watcher monitoring {} repos (polling)", repos.len());
 
     let mut states: HashMap<PathBuf, RepoState> = HashMap::new();
 
-    // Initialize states
     for repo_path in &repos {
         if let Ok(repo) = git2::Repository::open(repo_path) {
             let (oid, branch) = get_head_info(&repo);
@@ -90,7 +185,6 @@ pub async fn run(config: Arc<CortexConfig>, bus: EventBus) -> Result<()> {
                 head_branch: None,
             });
 
-            // Detect branch switch
             if state.head_branch != current_branch {
                 if let Some(ref branch) = current_branch {
                     let event = CortexEvent {
@@ -107,12 +201,15 @@ pub async fn run(config: Arc<CortexConfig>, bus: EventBus) -> Result<()> {
                         session_id: None,
                     };
                     bus.publish(event);
-                    tracing::debug!("git checkout detected: {:?} -> {}", state.head_branch, branch);
+                    tracing::debug!(
+                        "git checkout detected: {:?} -> {}",
+                        state.head_branch,
+                        branch
+                    );
                 }
                 state.head_branch = current_branch.clone();
             }
 
-            // Detect new commit
             if state.head_oid != current_oid {
                 if let Some(oid) = current_oid {
                     if let Ok(commit) = repo.find_commit(oid) {
