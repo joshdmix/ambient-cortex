@@ -26,6 +26,7 @@ pub struct InferenceEngine {
     session_id: String,
     session_start: chrono::DateTime<Utc>,
     session_events: Vec<CortexEvent>,
+    pending_session_summary: Option<String>,
 }
 
 impl InferenceEngine {
@@ -39,6 +40,7 @@ impl InferenceEngine {
             session_id: generate_session_id(),
             session_start: Utc::now(),
             session_events: Vec::new(),
+            pending_session_summary: None,
         }
     }
 
@@ -106,6 +108,11 @@ impl InferenceEngine {
                     score
                 );
             }
+        }
+
+        // Process any pending session summary via Claude
+        if let Some(context) = self.pending_session_summary.take() {
+            self.call_claude_session_summary(&context).await?;
         }
 
         // Claude-powered insights for high-signal events
@@ -216,6 +223,34 @@ impl InferenceEngine {
         Ok(())
     }
 
+    /// Call Claude to generate a richer session summary.
+    async fn call_claude_session_summary(&mut self, context: &str) -> Result<()> {
+        let claude = match self.claude.as_mut() {
+            Some(c) if c.is_enabled() => c,
+            _ => return Ok(()),
+        };
+
+        match claude
+            .generate_insight(context, PromptType::SessionSummary)
+            .await
+        {
+            Ok(Some(mut insight)) => {
+                let score = self.ranker.score(&insight, 1);
+                insight.relevance = score;
+                if self.ranker.passes_threshold(score) {
+                    tracing::info!("storing claude session summary: {}", insight.title);
+                    self.graph.store_insight(&insight)?;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("claude session summary failed: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Detect session gaps >30 minutes and rotate the session.
     fn maybe_rotate_session(&mut self, event: &CortexEvent) {
         let gap = (event.timestamp - self.session_start).num_seconds();
@@ -229,6 +264,7 @@ impl InferenceEngine {
                     since_last,
                     self.session_id
                 );
+                self.summarize_session();
                 self.session_id = generate_session_id();
                 self.session_start = event.timestamp;
                 self.session_events.clear();
@@ -240,6 +276,111 @@ impl InferenceEngine {
         if gap > 1800 && self.session_events.is_empty() {
             self.session_id = generate_session_id();
             self.session_start = event.timestamp;
+        }
+    }
+
+    /// Generate a summary for the completed session and store it as an insight.
+    fn summarize_session(&mut self) {
+        if self.session_events.is_empty() {
+            return;
+        }
+
+        let event_count = self.session_events.len();
+        let files: Vec<String> = self
+            .session_events
+            .iter()
+            .filter_map(|e| e.file_path.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let commit_count = self
+            .session_events
+            .iter()
+            .filter(|e| matches!(e.event_type, EventType::GitCommit))
+            .count();
+        let command_count = self
+            .session_events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.event_type,
+                    EventType::CommandRun | EventType::CommandFail
+                )
+            })
+            .count();
+        let project = self
+            .session_events
+            .iter()
+            .find_map(|e| e.project.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Generate local summary (Claude summarization handled separately below)
+        let files_str = if files.is_empty() {
+            "no files".to_string()
+        } else if files.len() <= 5 {
+            files.join(", ")
+        } else {
+            format!("{} and {} more", files[..5].join(", "), files.len() - 5)
+        };
+
+        let summary = format!(
+            "Worked on {} in {}, {} commands, {} commits",
+            files_str, project, command_count, commit_count
+        );
+
+        let duration_secs = if let Some(last) = self.session_events.last() {
+            (last.timestamp - self.session_start).num_seconds()
+        } else {
+            0
+        };
+        let duration_min = duration_secs / 60;
+
+        let title = format!("Session summary ({}m, {} events)", duration_min, event_count);
+
+        let insight = cortex_common::models::Insight {
+            id: None,
+            created_at: Utc::now(),
+            trigger_event: None,
+            insight_type: cortex_common::models::InsightType::History,
+            title,
+            body: summary.clone(),
+            relevance: 0.5,
+            surfaced: false,
+            dismissed: false,
+            file_path: None,
+            project: Some(project.clone()),
+        };
+
+        if let Err(e) = self.graph.store_insight(&insight) {
+            tracing::warn!("failed to store session summary: {}", e);
+        } else {
+            tracing::info!("session summary stored: {}", summary);
+        }
+
+        // If Claude is enabled, also generate a richer summary
+        if self.claude.is_some() {
+            let events_summary: Vec<String> = self
+                .session_events
+                .iter()
+                .take(50)
+                .map(|e| {
+                    format!(
+                        "{:?}: {}",
+                        e.event_type,
+                        e.file_path.as_deref().unwrap_or("n/a")
+                    )
+                })
+                .collect();
+            let context = format!(
+                "Session lasted {} minutes with {} events in project {}. Events: {}",
+                duration_min,
+                event_count,
+                project,
+                events_summary.join("; ")
+            );
+
+            // Store context for async Claude call on next event
+            self.pending_session_summary = Some(context);
         }
     }
 }
