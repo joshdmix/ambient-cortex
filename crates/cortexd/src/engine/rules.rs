@@ -602,3 +602,329 @@ fn format_duration(seconds: i64) -> String {
         format!("{} day{}", days, if days == 1 { "" } else { "s" })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::store::Store;
+    use crate::graph::KnowledgeGraph;
+    use chrono::{Duration, Utc};
+    use cortex_common::events::{CortexEvent, EventSource, EventType};
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    fn make_graph() -> Arc<KnowledgeGraph> {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = Store::new(tmp.path()).unwrap();
+        // Keep the tempfile alive by leaking it so the DB isn't deleted
+        let _ = tmp.into_temp_path();
+        Arc::new(KnowledgeGraph::new(store))
+    }
+
+    fn make_event(
+        event_type: EventType,
+        file_path: Option<&str>,
+        project: Option<&str>,
+    ) -> CortexEvent {
+        CortexEvent {
+            id: None,
+            timestamp: Utc::now(),
+            event_type,
+            source: EventSource::Filesystem,
+            project: project.map(|s| s.to_string()),
+            file_path: file_path.map(|s| s.to_string()),
+            payload: serde_json::json!({}),
+            session_id: None,
+        }
+    }
+
+    fn make_event_at(
+        event_type: EventType,
+        file_path: Option<&str>,
+        project: Option<&str>,
+        timestamp: chrono::DateTime<Utc>,
+    ) -> CortexEvent {
+        let mut e = make_event(event_type, file_path, project);
+        e.timestamp = timestamp;
+        e
+    }
+
+    #[test]
+    fn co_edit_reminder() {
+        let graph = make_graph();
+        let rules = LocalRules::new();
+
+        // Build a strong co-edit relation by alternating saves of two files.
+        // Each ingest_event calls update_file_relations which tracks co-edits.
+        // We need the relation strength > 3.
+        for i in 0..5 {
+            let ts = Utc::now() - Duration::seconds(50 - i * 10);
+            let e_a = make_event_at(EventType::FileSave, Some("/src/foo.rs"), Some("proj"), ts);
+            graph.ingest_event(&e_a).unwrap();
+            let e_b = make_event_at(
+                EventType::FileSave,
+                Some("/src/bar.rs"),
+                Some("proj"),
+                ts + Duration::seconds(1),
+            );
+            graph.ingest_event(&e_b).unwrap();
+        }
+
+        let event = make_event(EventType::FileSave, Some("/src/foo.rs"), Some("proj"));
+        let insights = rules.evaluate(&event, &graph);
+
+        assert!(
+            insights.iter().any(|i| i.body.contains("/src/bar.rs")),
+            "Expected co-edit insight mentioning bar.rs, got: {:?}",
+            insights.iter().map(|i| &i.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn co_edit_reminder_no_trigger() {
+        let graph = make_graph();
+        let rules = LocalRules::new();
+
+        // Only one co-edit pair => strength = 1 (weak)
+        let e_a = make_event(EventType::FileSave, Some("/src/foo.rs"), Some("proj"));
+        graph.ingest_event(&e_a).unwrap();
+        let e_b = make_event(EventType::FileSave, Some("/src/bar.rs"), Some("proj"));
+        graph.ingest_event(&e_b).unwrap();
+
+        let event = make_event(EventType::FileSave, Some("/src/foo.rs"), Some("proj"));
+        let insights = rules.evaluate(&event, &graph);
+
+        assert!(
+            !insights
+                .iter()
+                .any(|i| i.title.contains("usually edit these files")),
+            "Should not trigger co-edit reminder with weak relation"
+        );
+    }
+
+    #[test]
+    fn context_switch() {
+        let graph = make_graph();
+        let rules = LocalRules::new();
+
+        // Insert an old event for the file (>1 hour ago)
+        let old_time = Utc::now() - Duration::hours(2);
+        let old_event = make_event_at(
+            EventType::FileSave,
+            Some("/src/main.rs"),
+            Some("myproject"),
+            old_time,
+        );
+        graph.ingest_event(&old_event).unwrap();
+
+        // Insert enough events to pass the len >= 5 check on get_recent_events(20)
+        for i in 0..5 {
+            let filler = make_event_at(
+                EventType::FileSave,
+                Some(&format!("/src/filler{}.rs", i)),
+                Some("myproject"),
+                old_time + Duration::seconds(i as i64),
+            );
+            graph.ingest_event(&filler).unwrap();
+        }
+
+        // Now send a new event for the same file with current timestamp (>1 hour gap)
+        let new_event = make_event(EventType::FileSave, Some("/src/main.rs"), Some("myproject"));
+        graph.ingest_event(&new_event).unwrap();
+
+        let insights = rules.evaluate(&new_event, &graph);
+
+        assert!(
+            insights.iter().any(|i| i.title.contains("Welcome back")),
+            "Expected context switch insight, got: {:?}",
+            insights.iter().map(|i| &i.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn edit_revert_detector() {
+        let graph = make_graph();
+        let rules = LocalRules::new();
+
+        // Insert >3 FileSave events for same file within 5 minutes
+        for i in 0..4 {
+            let evt = make_event_at(
+                EventType::FileSave,
+                Some("/src/buggy.rs"),
+                Some("proj"),
+                Utc::now() - Duration::seconds(60 * (3 - i)),
+            );
+            graph.ingest_event(&evt).unwrap();
+        }
+
+        // The 4th (current) event triggers the check
+        let trigger = make_event(EventType::FileSave, Some("/src/buggy.rs"), Some("proj"));
+        graph.ingest_event(&trigger).unwrap();
+
+        let insights = rules.evaluate(&trigger, &graph);
+
+        assert!(
+            insights.iter().any(|i| i.title.contains("Rapid file saves")),
+            "Expected edit-revert insight, got: {:?}",
+            insights.iter().map(|i| &i.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn edit_revert_no_trigger() {
+        let graph = make_graph();
+        let rules = LocalRules::new();
+
+        // Only 2 saves -- should not trigger (threshold is >3)
+        for i in 0..2 {
+            let evt = make_event_at(
+                EventType::FileSave,
+                Some("/src/ok.rs"),
+                Some("proj"),
+                Utc::now() - Duration::seconds(30 * (1 - i)),
+            );
+            graph.ingest_event(&evt).unwrap();
+        }
+
+        let trigger = make_event(EventType::FileSave, Some("/src/ok.rs"), Some("proj"));
+        graph.ingest_event(&trigger).unwrap();
+
+        let insights = rules.evaluate(&trigger, &graph);
+
+        assert!(
+            !insights.iter().any(|i| i.title.contains("Rapid file saves")),
+            "Should not trigger edit-revert with only 2 saves"
+        );
+    }
+
+    #[test]
+    fn error_pattern() {
+        let graph = make_graph();
+        let rules = LocalRules::new();
+
+        // Insert >2 CommandFail events with same command prefix in 30 min
+        for i in 0..3 {
+            let mut evt = make_event_at(
+                EventType::CommandFail,
+                None,
+                Some("proj"),
+                Utc::now() - Duration::seconds(60 * (2 - i)),
+            );
+            evt.payload = serde_json::json!({"cmd": "cargo build --release"});
+            graph.ingest_event(&evt).unwrap();
+        }
+
+        // Trigger event
+        let mut trigger = make_event(EventType::CommandFail, None, Some("proj"));
+        trigger.payload = serde_json::json!({"cmd": "cargo build --release"});
+        graph.ingest_event(&trigger).unwrap();
+
+        let insights = rules.evaluate(&trigger, &graph);
+
+        assert!(
+            insights
+                .iter()
+                .any(|i| i.title.contains("Repeated command failures")),
+            "Expected error pattern insight, got: {:?}",
+            insights.iter().map(|i| &i.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn stale_branch() {
+        let graph = make_graph();
+        let rules = LocalRules::new();
+
+        // Insert an old GitCheckout event for branch "feature-old" (>7 days ago)
+        let old_time = Utc::now() - Duration::days(10);
+        let mut old_event = make_event_at(
+            EventType::GitCheckout,
+            None,
+            Some("proj"),
+            old_time,
+        );
+        old_event.payload = serde_json::json!({"branch": "feature-old"});
+        graph.ingest_event(&old_event).unwrap();
+
+        // Now checkout that same branch again
+        let mut trigger = make_event(EventType::GitCheckout, None, Some("proj"));
+        trigger.payload = serde_json::json!({"branch": "feature-old"});
+        graph.ingest_event(&trigger).unwrap();
+
+        let insights = rules.evaluate(&trigger, &graph);
+
+        assert!(
+            insights
+                .iter()
+                .any(|i| i.title.contains("Stale branch")),
+            "Expected stale branch insight, got: {:?}",
+            insights.iter().map(|i| &i.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cross_project_pattern() {
+        let rules = LocalRules::new();
+        let graph = make_graph();
+
+        // Send events from 3 different projects
+        let e1 = make_event(EventType::FileSave, Some("/a/foo.rs"), Some("project-a"));
+        let e2 = make_event(EventType::FileSave, Some("/b/bar.rs"), Some("project-b"));
+        let e3 = make_event(EventType::FileSave, Some("/c/baz.rs"), Some("project-c"));
+
+        // Evaluate each -- insight should fire on the 3rd
+        let _ = rules.evaluate(&e1, &graph);
+        let _ = rules.evaluate(&e2, &graph);
+        let insights = rules.evaluate(&e3, &graph);
+
+        assert!(
+            insights
+                .iter()
+                .any(|i| i.title.contains("Cross-project pattern")),
+            "Expected cross-project insight, got: {:?}",
+            insights.iter().map(|i| &i.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn predictive_action() {
+        let rules = LocalRules::new();
+        let graph = make_graph();
+
+        // Build up >5 (file_save -> command_run) pairs
+        for _ in 0..6 {
+            let save = make_event(EventType::FileSave, Some("/src/lib.rs"), Some("proj"));
+            let _ = rules.evaluate(&save, &graph);
+
+            let mut run = make_event(EventType::CommandRun, Some("/src/lib.rs"), Some("proj"));
+            run.payload = serde_json::json!({"cmd": "cargo test"});
+            let _ = rules.evaluate(&run, &graph);
+        }
+
+        // Verify the pair was tracked in action_pairs
+        let pairs = rules.action_pairs.lock().unwrap();
+        let key = ("/src/lib.rs".to_string(), "cargo test".to_string());
+        let count = pairs.get(&key).copied().unwrap_or(0);
+        assert!(
+            count >= 6,
+            "Expected action pair count >= 6, got {}",
+            count
+        );
+    }
+
+    #[test]
+    fn evaluate_returns_empty() {
+        let graph = make_graph();
+        let rules = LocalRules::new();
+
+        // A benign FileOpen event with no history should produce nothing
+        let event = make_event(EventType::FileOpen, Some("/tmp/nothing.txt"), None);
+        let insights = rules.evaluate(&event, &graph);
+
+        assert!(
+            insights.is_empty(),
+            "Expected empty insights for benign event, got: {:?}",
+            insights.iter().map(|i| &i.title).collect::<Vec<_>>()
+        );
+    }
+}

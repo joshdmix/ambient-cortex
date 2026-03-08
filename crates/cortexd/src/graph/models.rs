@@ -175,3 +175,199 @@ pub fn serialize_relation_type(rt: &cortex_common::models::RelationType) -> Stri
         cortex_common::models::RelationType::TestFor => "test_for".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cortex_common::events::{EventSource, EventType};
+    use cortex_common::models::{InsightType, RelationType};
+
+    // ---------- EventType roundtrip ----------
+
+    #[test]
+    fn event_type_roundtrip_file_open() {
+        let s = serialize_event_type(&EventType::FileOpen);
+        assert_eq!(s, "file_open");
+        assert!(matches!(deserialize_event_type(&s), EventType::FileOpen));
+    }
+
+    #[test]
+    fn event_type_roundtrip_file_save() {
+        let s = serialize_event_type(&EventType::FileSave);
+        assert_eq!(s, "file_save");
+        assert!(matches!(deserialize_event_type(&s), EventType::FileSave));
+    }
+
+    #[test]
+    fn event_type_roundtrip_file_delete() {
+        let s = serialize_event_type(&EventType::FileDelete);
+        assert_eq!(s, "file_delete");
+        assert!(matches!(deserialize_event_type(&s), EventType::FileDelete));
+    }
+
+    #[test]
+    fn event_type_roundtrip_command_run() {
+        let s = serialize_event_type(&EventType::CommandRun);
+        assert_eq!(s, "command_run");
+        assert!(matches!(deserialize_event_type(&s), EventType::CommandRun));
+    }
+
+    #[test]
+    fn event_type_roundtrip_command_fail() {
+        let s = serialize_event_type(&EventType::CommandFail);
+        assert_eq!(s, "command_fail");
+        assert!(matches!(deserialize_event_type(&s), EventType::CommandFail));
+    }
+
+    #[test]
+    fn event_type_roundtrip_git_commit() {
+        let s = serialize_event_type(&EventType::GitCommit);
+        assert_eq!(s, "git_commit");
+        assert!(matches!(deserialize_event_type(&s), EventType::GitCommit));
+    }
+
+    #[test]
+    fn event_type_roundtrip_git_checkout() {
+        let s = serialize_event_type(&EventType::GitCheckout);
+        assert_eq!(s, "git_checkout");
+        assert!(matches!(deserialize_event_type(&s), EventType::GitCheckout));
+    }
+
+    #[test]
+    fn event_type_roundtrip_git_merge() {
+        let s = serialize_event_type(&EventType::GitMerge);
+        assert_eq!(s, "git_merge");
+        assert!(matches!(deserialize_event_type(&s), EventType::GitMerge));
+    }
+
+    #[test]
+    fn event_type_roundtrip_build_success() {
+        let s = serialize_event_type(&EventType::BuildSuccess);
+        assert_eq!(s, "build_success");
+        assert!(matches!(deserialize_event_type(&s), EventType::BuildSuccess));
+    }
+
+    #[test]
+    fn event_type_roundtrip_build_fail() {
+        let s = serialize_event_type(&EventType::BuildFail);
+        assert_eq!(s, "build_fail");
+        assert!(matches!(deserialize_event_type(&s), EventType::BuildFail));
+    }
+
+    #[test]
+    fn event_type_roundtrip_error_encountered() {
+        let s = serialize_event_type(&EventType::ErrorEncountered);
+        assert_eq!(s, "error_encountered");
+        assert!(matches!(deserialize_event_type(&s), EventType::ErrorEncountered));
+    }
+
+    #[test]
+    fn event_type_roundtrip_claude_session() {
+        let s = serialize_event_type(&EventType::ClaudeSession);
+        assert_eq!(s, "claude_session");
+        assert!(matches!(deserialize_event_type(&s), EventType::ClaudeSession));
+    }
+
+    #[test]
+    fn event_type_unknown_falls_back_to_file_save() {
+        assert!(matches!(deserialize_event_type("nonsense"), EventType::FileSave));
+        assert!(matches!(deserialize_event_type(""), EventType::FileSave));
+        assert!(matches!(deserialize_event_type("FILE_OPEN"), EventType::FileSave));
+    }
+
+    // ---------- EventSource roundtrip ----------
+
+    #[test]
+    fn source_roundtrip_terminal() {
+        let s = serialize_source(&EventSource::Terminal);
+        assert_eq!(s, "terminal");
+        assert!(matches!(deserialize_source(&s), EventSource::Terminal));
+    }
+
+    #[test]
+    fn source_roundtrip_filesystem() {
+        let s = serialize_source(&EventSource::Filesystem);
+        assert_eq!(s, "filesystem");
+        assert!(matches!(deserialize_source(&s), EventSource::Filesystem));
+    }
+
+    #[test]
+    fn source_roundtrip_git() {
+        let s = serialize_source(&EventSource::Git);
+        assert_eq!(s, "git");
+        assert!(matches!(deserialize_source(&s), EventSource::Git));
+    }
+
+    #[test]
+    fn source_roundtrip_editor() {
+        let s = serialize_source(&EventSource::Editor);
+        assert_eq!(s, "editor");
+        assert!(matches!(deserialize_source(&s), EventSource::Editor));
+    }
+
+    #[test]
+    fn source_unknown_falls_back_to_filesystem() {
+        assert!(matches!(deserialize_source("unknown"), EventSource::Filesystem));
+        assert!(matches!(deserialize_source(""), EventSource::Filesystem));
+        assert!(matches!(deserialize_source("TERMINAL"), EventSource::Filesystem));
+    }
+
+    // ---------- InsightType roundtrip ----------
+
+    #[test]
+    fn insight_type_roundtrip_warning() {
+        let s = serialize_insight_type(&InsightType::Warning);
+        assert_eq!(s, "warning");
+        assert!(matches!(deserialize_insight_type(&s), InsightType::Warning));
+    }
+
+    #[test]
+    fn insight_type_roundtrip_reminder() {
+        let s = serialize_insight_type(&InsightType::Reminder);
+        assert_eq!(s, "reminder");
+        assert!(matches!(deserialize_insight_type(&s), InsightType::Reminder));
+    }
+
+    #[test]
+    fn insight_type_roundtrip_suggestion() {
+        let s = serialize_insight_type(&InsightType::Suggestion);
+        assert_eq!(s, "suggestion");
+        assert!(matches!(deserialize_insight_type(&s), InsightType::Suggestion));
+    }
+
+    #[test]
+    fn insight_type_roundtrip_history() {
+        let s = serialize_insight_type(&InsightType::History);
+        assert_eq!(s, "history");
+        assert!(matches!(deserialize_insight_type(&s), InsightType::History));
+    }
+
+    #[test]
+    fn insight_type_unknown_falls_back_to_suggestion() {
+        assert!(matches!(deserialize_insight_type("unknown"), InsightType::Suggestion));
+        assert!(matches!(deserialize_insight_type(""), InsightType::Suggestion));
+        assert!(matches!(deserialize_insight_type("WARNING"), InsightType::Suggestion));
+    }
+
+    // ---------- RelationType serialization ----------
+
+    #[test]
+    fn relation_type_co_edited() {
+        assert_eq!(serialize_relation_type(&RelationType::CoEdited), "co_edited");
+    }
+
+    #[test]
+    fn relation_type_imports() {
+        assert_eq!(serialize_relation_type(&RelationType::Imports), "imports");
+    }
+
+    #[test]
+    fn relation_type_breaks_when_changed() {
+        assert_eq!(serialize_relation_type(&RelationType::BreaksWhenChanged), "breaks_when_changed");
+    }
+
+    #[test]
+    fn relation_type_test_for() {
+        assert_eq!(serialize_relation_type(&RelationType::TestFor), "test_for");
+    }
+}

@@ -369,3 +369,387 @@ impl Store {
         Ok(deleted as u64)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use cortex_common::events::{CortexEvent, EventSource, EventType};
+    use cortex_common::models::{Insight, InsightType, RelationType};
+    use tempfile::NamedTempFile;
+
+    fn make_event(
+        file_path: Option<&str>,
+        event_type: EventType,
+        session_id: Option<&str>,
+    ) -> CortexEvent {
+        CortexEvent {
+            id: None,
+            timestamp: Utc::now(),
+            event_type,
+            source: EventSource::Editor,
+            project: Some("test-project".to_string()),
+            file_path: file_path.map(|s| s.to_string()),
+            payload: serde_json::json!({"test": true}),
+            session_id: session_id.map(|s| s.to_string()),
+        }
+    }
+
+    fn make_event_with_timestamp(
+        file_path: Option<&str>,
+        timestamp: chrono::DateTime<Utc>,
+    ) -> CortexEvent {
+        CortexEvent {
+            id: None,
+            timestamp,
+            event_type: EventType::FileSave,
+            source: EventSource::Editor,
+            project: Some("test-project".to_string()),
+            file_path: file_path.map(|s| s.to_string()),
+            payload: serde_json::json!({}),
+            session_id: None,
+        }
+    }
+
+    fn make_insight(title: &str, relevance: f64) -> Insight {
+        Insight {
+            id: None,
+            created_at: Utc::now(),
+            trigger_event: None,
+            insight_type: InsightType::Suggestion,
+            title: title.to_string(),
+            body: "test body".to_string(),
+            relevance,
+            surfaced: false,
+            dismissed: false,
+            file_path: Some("/test/file.rs".to_string()),
+            project: Some("test-project".to_string()),
+        }
+    }
+
+    fn new_store() -> (Store, NamedTempFile) {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = Store::new(tmp.path()).unwrap();
+        (store, tmp)
+    }
+
+    #[test]
+    fn insert_event_and_get_events_for_file() {
+        let (store, _tmp) = new_store();
+
+        let e1 = make_event_with_timestamp(
+            Some("/src/main.rs"),
+            Utc::now() - Duration::seconds(10),
+        );
+        let e2 = make_event_with_timestamp(
+            Some("/src/main.rs"),
+            Utc::now(),
+        );
+        let e3 = make_event(Some("/src/other.rs"), EventType::FileOpen, None);
+
+        store.insert_event(&e1).unwrap();
+        store.insert_event(&e2).unwrap();
+        store.insert_event(&e3).unwrap();
+
+        let events = store.get_events_for_file("/src/main.rs", 10).unwrap();
+        assert_eq!(events.len(), 2);
+        // Should be DESC by timestamp — newest first
+        assert!(events[0].timestamp >= events[1].timestamp);
+
+        // Other file should not appear
+        let other = store.get_events_for_file("/src/other.rs", 10).unwrap();
+        assert_eq!(other.len(), 1);
+    }
+
+    #[test]
+    fn insert_event_and_get_recent_events() {
+        let (store, _tmp) = new_store();
+
+        for i in 0..5 {
+            let e = make_event_with_timestamp(
+                Some(&format!("/file{}.rs", i)),
+                Utc::now() - Duration::seconds(5 - i),
+            );
+            store.insert_event(&e).unwrap();
+        }
+
+        let recent = store.get_recent_events(3).unwrap();
+        assert_eq!(recent.len(), 3);
+        // Verify DESC ordering
+        assert!(recent[0].timestamp >= recent[1].timestamp);
+        assert!(recent[1].timestamp >= recent[2].timestamp);
+
+        let all = store.get_recent_events(100).unwrap();
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn upsert_file_node_increments_touch_count() {
+        let (store, _tmp) = new_store();
+
+        let id1 = store.upsert_file_node("/src/lib.rs", "proj").unwrap();
+        let node = store.get_file_node("/src/lib.rs").unwrap().unwrap();
+        assert_eq!(node.touch_count, 1);
+
+        let id2 = store.upsert_file_node("/src/lib.rs", "proj").unwrap();
+        assert_eq!(id1, id2);
+        let node = store.get_file_node("/src/lib.rs").unwrap().unwrap();
+        assert_eq!(node.touch_count, 2);
+
+        let id3 = store.upsert_file_node("/src/lib.rs", "proj").unwrap();
+        assert_eq!(id1, id3);
+        let node = store.get_file_node("/src/lib.rs").unwrap().unwrap();
+        assert_eq!(node.touch_count, 3);
+    }
+
+    #[test]
+    fn get_file_node_existing_and_missing() {
+        let (store, _tmp) = new_store();
+
+        assert!(store.get_file_node("/nonexistent").unwrap().is_none());
+
+        store.upsert_file_node("/exists.rs", "proj").unwrap();
+        let node = store.get_file_node("/exists.rs").unwrap();
+        assert!(node.is_some());
+        let node = node.unwrap();
+        assert_eq!(node.path, "/exists.rs");
+        assert_eq!(node.project, "proj");
+    }
+
+    #[test]
+    fn upsert_file_relation_and_get_related_files() {
+        let (store, _tmp) = new_store();
+
+        let id_a = store.upsert_file_node("/a.rs", "proj").unwrap();
+        let id_b = store.upsert_file_node("/b.rs", "proj").unwrap();
+        let id_c = store.upsert_file_node("/c.rs", "proj").unwrap();
+
+        store
+            .upsert_file_relation(id_a, id_b, &RelationType::CoEdited)
+            .unwrap();
+        store
+            .upsert_file_relation(id_a, id_c, &RelationType::Imports)
+            .unwrap();
+
+        let related = store.get_related_files("/a.rs").unwrap();
+        assert_eq!(related.len(), 2);
+
+        // Upsert again to increment strength
+        store
+            .upsert_file_relation(id_a, id_b, &RelationType::CoEdited)
+            .unwrap();
+        let related = store.get_related_files("/a.rs").unwrap();
+        let co_edited = related.iter().find(|(p, _, _)| p == "/b.rs").unwrap();
+        assert!((co_edited.2 - 2.0).abs() < f64::EPSILON, "strength should be 2.0 after re-upsert");
+
+        // Query from the other side too
+        let related_b = store.get_related_files("/b.rs").unwrap();
+        assert!(!related_b.is_empty());
+    }
+
+    #[test]
+    fn insert_insight_and_get_pending() {
+        let (store, _tmp) = new_store();
+
+        store.insert_insight(&make_insight("insight1", 0.8)).unwrap();
+        store.insert_insight(&make_insight("insight2", 0.5)).unwrap();
+
+        // Insert one that is already surfaced
+        let mut surfaced = make_insight("surfaced", 0.9);
+        surfaced.surfaced = true;
+        store.insert_insight(&surfaced).unwrap();
+
+        // Insert one that is already dismissed
+        let mut dismissed = make_insight("dismissed", 0.7);
+        dismissed.dismissed = true;
+        store.insert_insight(&dismissed).unwrap();
+
+        let pending = store.get_pending_insights().unwrap();
+        assert_eq!(pending.len(), 2);
+        // Ordered by relevance DESC
+        assert!(pending[0].relevance >= pending[1].relevance);
+        assert_eq!(pending[0].title, "insight1");
+        assert_eq!(pending[1].title, "insight2");
+    }
+
+    #[test]
+    fn dismiss_insight_filters_from_pending() {
+        let (store, _tmp) = new_store();
+
+        store.insert_insight(&make_insight("to_dismiss", 0.8)).unwrap();
+        store.insert_insight(&make_insight("keep", 0.5)).unwrap();
+
+        let pending = store.get_pending_insights().unwrap();
+        assert_eq!(pending.len(), 2);
+        let dismiss_id = pending.iter().find(|i| i.title == "to_dismiss").unwrap().id.unwrap();
+
+        store.dismiss_insight(dismiss_id).unwrap();
+
+        let pending = store.get_pending_insights().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].title, "keep");
+    }
+
+    #[test]
+    fn upvote_insight_increases_relevance_and_surfaces() {
+        let (store, _tmp) = new_store();
+
+        store.insert_insight(&make_insight("upvotable", 0.5)).unwrap();
+
+        let pending = store.get_pending_insights().unwrap();
+        let id = pending[0].id.unwrap();
+        let original_relevance = pending[0].relevance;
+
+        store.upvote_insight(id).unwrap();
+
+        // After upvote it's surfaced, so not in pending
+        let pending = store.get_pending_insights().unwrap();
+        assert!(pending.is_empty());
+
+        // Verify relevance increased by querying directly
+        let count: f64 = store
+            .conn
+            .query_row(
+                "SELECT relevance FROM insights WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!((count - (original_relevance + 0.1)).abs() < f64::EPSILON);
+
+        // Verify surfaced flag
+        let surfaced: i64 = store
+            .conn
+            .query_row(
+                "SELECT surfaced FROM insights WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(surfaced, 1);
+    }
+
+    #[test]
+    fn mark_insight_surfaced_sets_flag() {
+        let (store, _tmp) = new_store();
+
+        store.insert_insight(&make_insight("mark_me", 0.5)).unwrap();
+        let pending = store.get_pending_insights().unwrap();
+        assert_eq!(pending.len(), 1);
+        let id = pending[0].id.unwrap();
+
+        store.mark_insight_surfaced(id).unwrap();
+
+        // Should no longer be pending
+        let pending = store.get_pending_insights().unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn get_event_count_and_get_insight_count() {
+        let (store, _tmp) = new_store();
+
+        assert_eq!(store.get_event_count().unwrap(), 0);
+        assert_eq!(store.get_insight_count().unwrap(), 0);
+
+        for _ in 0..3 {
+            store
+                .insert_event(&make_event(Some("/f.rs"), EventType::FileSave, None))
+                .unwrap();
+        }
+        store.insert_insight(&make_insight("i1", 0.5)).unwrap();
+        store.insert_insight(&make_insight("i2", 0.6)).unwrap();
+
+        assert_eq!(store.get_event_count().unwrap(), 3);
+        assert_eq!(store.get_insight_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn get_sessions_groups_by_session_id() {
+        let (store, _tmp) = new_store();
+
+        // Session A: 2 events
+        store
+            .insert_event(&make_event(Some("/a.rs"), EventType::FileSave, Some("sess-a")))
+            .unwrap();
+        store
+            .insert_event(&make_event(Some("/b.rs"), EventType::FileOpen, Some("sess-a")))
+            .unwrap();
+
+        // Session B: 1 event
+        store
+            .insert_event(&make_event(Some("/c.rs"), EventType::FileSave, Some("sess-b")))
+            .unwrap();
+
+        // No session: should not appear
+        store
+            .insert_event(&make_event(Some("/d.rs"), EventType::FileSave, None))
+            .unwrap();
+
+        let sessions = store.get_sessions(10).unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        let sess_a = sessions.iter().find(|s| s.session_id == "sess-a").unwrap();
+        assert_eq!(sess_a.event_count, 2);
+
+        let sess_b = sessions.iter().find(|s| s.session_id == "sess-b").unwrap();
+        assert_eq!(sess_b.event_count, 1);
+    }
+
+    #[test]
+    fn prune_old_events_deletes_only_old() {
+        let (store, _tmp) = new_store();
+
+        // Old event: 100 days ago
+        let old = make_event_with_timestamp(
+            Some("/old.rs"),
+            Utc::now() - Duration::days(100),
+        );
+        // Recent event: now
+        let recent = make_event_with_timestamp(Some("/new.rs"), Utc::now());
+
+        store.insert_event(&old).unwrap();
+        store.insert_event(&recent).unwrap();
+        assert_eq!(store.get_event_count().unwrap(), 2);
+
+        let deleted = store.prune_old_events(30).unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(store.get_event_count().unwrap(), 1);
+
+        let remaining = store.get_recent_events(10).unwrap();
+        assert_eq!(remaining[0].file_path.as_deref(), Some("/new.rs"));
+    }
+
+    #[test]
+    fn prune_orphaned_embeddings_cleans_up() {
+        let (store, _tmp) = new_store();
+
+        // Insert an event and its embedding
+        let event_id = store
+            .insert_event(&make_event(Some("/f.rs"), EventType::FileSave, None))
+            .unwrap();
+        store
+            .insert_embedding("event", event_id, &[0.1, 0.2, 0.3], "test text")
+            .unwrap();
+
+        // Insert an embedding for a non-existent event
+        store
+            .insert_embedding("event", 9999, &[0.4, 0.5, 0.6], "orphan text")
+            .unwrap();
+
+        let count_before: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count_before, 2);
+
+        let pruned = store.prune_orphaned_embeddings().unwrap();
+        assert_eq!(pruned, 1);
+
+        let count_after: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count_after, 1);
+    }
+}
