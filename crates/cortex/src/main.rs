@@ -2,7 +2,7 @@ mod commands;
 
 use anyhow::Result;
 use clap::Parser;
-use commands::{config, history, install, query, search, status, tmux, tui};
+use commands::{config, export, history, import, install, query, search, status, tmux, tui};
 
 #[derive(Parser)]
 #[command(name = "cortex", about = "Ambient Cortex CLI", version)]
@@ -37,6 +37,18 @@ enum Command {
     Tui,
     /// Output status for tmux status bar
     TmuxStatus,
+    /// Export all data to a JSON file
+    Export {
+        /// Output file path
+        #[arg(long, default_value = "cortex-backup.json")]
+        output: String,
+    },
+    /// Import data from a JSON backup file
+    Import {
+        /// Input file path
+        #[arg(long)]
+        input: String,
+    },
     /// View or edit configuration
     Config {
         #[command(subcommand)]
@@ -69,6 +81,8 @@ async fn main() -> Result<()> {
         Command::Install => install::run()?,
         Command::Tui => tui::run().await?,
         Command::TmuxStatus => tmux::run()?,
+        Command::Export { output } => export::run(&output).await?,
+        Command::Import { input } => import::run(&input).await?,
         Command::Config { action } => match action {
             Some(ConfigAction::Edit) => config::edit()?,
             None => config::show()?,
