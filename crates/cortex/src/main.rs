@@ -2,7 +2,7 @@ mod commands;
 
 use anyhow::Result;
 use clap::Parser;
-use commands::{config, history, install, query, search, status, tui};
+use commands::{config, history, install, query, search, status, tmux, tui};
 
 #[derive(Parser)]
 #[command(name = "cortex", about = "Ambient Cortex CLI", version)]
@@ -35,6 +35,8 @@ enum Command {
     Install,
     /// Launch the TUI dashboard
     Tui,
+    /// Output status for tmux status bar
+    TmuxStatus,
     /// View or edit configuration
     Config {
         #[command(subcommand)]
@@ -66,6 +68,7 @@ async fn main() -> Result<()> {
         Command::Search { query } => search::run(&query).await?,
         Command::Install => install::run()?,
         Command::Tui => tui::run().await?,
+        Command::TmuxStatus => tmux::run()?,
         Command::Config { action } => match action {
             Some(ConfigAction::Edit) => config::edit()?,
             None => config::show()?,

@@ -4,6 +4,7 @@ pub mod install;
 pub mod query;
 pub mod search;
 pub mod status;
+pub mod tmux;
 pub mod tui;
 
 use anyhow::{Context, Result};
