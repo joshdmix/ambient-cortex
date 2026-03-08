@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Ambient Cortex — git post-commit hook
+# Install: cp this to .git/hooks/post-commit && chmod +x .git/hooks/post-commit
+
+PIPE="${XDG_RUNTIME_DIR:-/tmp}/cortex/terminal.pipe"
+[[ -p "$PIPE" ]] || exit 0
+
+HASH=$(git rev-parse HEAD 2>/dev/null)
+MSG=$(git log -1 --format='%s' 2>/dev/null)
+FILES=$(git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+BRANCH=$(git branch --show-current 2>/dev/null)
+
+printf '{"type":"git_commit","hash":"%s","message":"%s","files":"%s","branch":"%s"}\n' \
+    "$HASH" "${MSG//\"/\\\"}" "$FILES" "$BRANCH" \
+    > "$PIPE" 2>/dev/null
