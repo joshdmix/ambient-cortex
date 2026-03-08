@@ -1,16 +1,28 @@
 use chrono::{Duration, Utc};
 use cortex_common::events::{CortexEvent, EventType};
 use cortex_common::models::{Insight, InsightType};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::graph::KnowledgeGraph;
 
 /// Local (Tier 1) rules that generate insights without API calls.
-pub struct LocalRules;
+pub struct LocalRules {
+    /// Track project switches: Vec<(project, timestamp_epoch)>
+    project_switches: Mutex<Vec<(String, i64)>>,
+    /// Track (file_save → command_run) pairs: (file, command) → count
+    action_pairs: Mutex<HashMap<(String, String), u64>>,
+    /// Recent file saves: (file_path, timestamp_epoch)
+    recent_saves: Mutex<Vec<(String, i64)>>,
+}
 
 impl LocalRules {
     pub fn new() -> Self {
-        Self
+        Self {
+            project_switches: Mutex::new(Vec::new()),
+            action_pairs: Mutex::new(HashMap::new()),
+            recent_saves: Mutex::new(Vec::new()),
+        }
     }
 
     /// Run all local rules against the event. Returns any generated insights.
@@ -42,6 +54,14 @@ impl LocalRules {
         }
 
         if let Some(insight) = self.stale_branch(event, graph) {
+            insights.push(insight);
+        }
+
+        if let Some(insight) = self.cross_project_pattern(event) {
+            insights.push(insight);
+        }
+
+        if let Some(insight) = self.predictive_action(event) {
             insights.push(insight);
         }
 
@@ -337,6 +357,162 @@ impl LocalRules {
             file_path: None,
             project: event.project.clone(),
         })
+    }
+
+    /// Detect cross-project patterns: editing similar file types across multiple projects.
+    fn cross_project_pattern(
+        &self,
+        event: &CortexEvent,
+    ) -> Option<Insight> {
+        let project = event.project.as_ref()?;
+        let now = event.timestamp.timestamp();
+
+        let mut switches = self.project_switches.lock().unwrap();
+
+        // Record this project visit
+        if switches.last().map(|(p, _)| p != project).unwrap_or(true) {
+            switches.push((project.clone(), now));
+        }
+
+        // Trim entries older than 24 hours
+        let day_ago = now - 86400;
+        switches.retain(|(_, ts)| *ts > day_ago);
+
+        // Count unique projects visited today
+        let mut project_counts: HashMap<&str, usize> = HashMap::new();
+        for (p, _) in switches.iter() {
+            *project_counts.entry(p.as_str()).or_insert(0) += 1;
+        }
+
+        if project_counts.len() < 3 {
+            return None;
+        }
+
+        // Check if the same file type pattern appears across projects
+        let file_path = event.file_path.as_ref()?;
+        let ext = file_path.rsplit('.').next().unwrap_or("");
+        if ext.is_empty() {
+            return None;
+        }
+
+        // Check if we've already fired recently (simple dedup: only fire when crossing 3 projects)
+        let unique_projects: Vec<&str> = project_counts.keys().copied().collect();
+        if unique_projects.len() == 3 {
+            let project_list = unique_projects.join(", ");
+            let title = "Cross-project pattern detected".to_string();
+            let body = format!(
+                "You've been working across {} projects today: {}",
+                unique_projects.len(),
+                project_list
+            );
+
+            return Some(Insight {
+                id: None,
+                created_at: Utc::now(),
+                trigger_event: event.id,
+                insight_type: InsightType::Suggestion,
+                title,
+                body,
+                relevance: 0.6,
+                surfaced: false,
+                dismissed: false,
+                file_path: None,
+                project: Some(project.clone()),
+            });
+        }
+
+        None
+    }
+
+    /// Learn from patterns: if after editing file X, the user always runs command Y,
+    /// suggest Y when file X is saved again.
+    fn predictive_action(
+        &self,
+        event: &CortexEvent,
+    ) -> Option<Insight> {
+        let now = event.timestamp.timestamp();
+
+        match event.event_type {
+            EventType::FileSave => {
+                // Record this save for later correlation
+                let file_path = event.file_path.as_ref()?;
+                let mut saves = self.recent_saves.lock().unwrap();
+                saves.push((file_path.clone(), now));
+                // Keep only last 5 minutes of saves
+                saves.retain(|(_, ts)| now - ts < 300);
+                None
+            }
+            EventType::CommandRun => {
+                // Check if there was a recent file save, and record the pair
+                let cmd = event
+                    .payload
+                    .get("cmd")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if cmd.is_empty() {
+                    return None;
+                }
+
+                let cmd_prefix = extract_command_prefix(cmd);
+                let saves = self.recent_saves.lock().unwrap();
+
+                // Find files saved in the last 5 minutes
+                let recent_files: Vec<String> = saves
+                    .iter()
+                    .filter(|(_, ts)| now - ts < 300)
+                    .map(|(f, _)| f.clone())
+                    .collect();
+                drop(saves);
+
+                let mut pairs = self.action_pairs.lock().unwrap();
+                for file in &recent_files {
+                    let key = (file.clone(), cmd_prefix.clone());
+                    *pairs.entry(key).or_insert(0) += 1;
+                }
+
+                None
+            }
+            _ => {
+                // For file saves, check if we should suggest a command
+                if !matches!(event.event_type, EventType::FileSave) {
+                    return None;
+                }
+
+                let file_path = event.file_path.as_ref()?;
+                let pairs = self.action_pairs.lock().unwrap();
+
+                // Find the strongest pair for this file
+                let best = pairs
+                    .iter()
+                    .filter(|((f, _), count)| f == file_path && **count > 5)
+                    .max_by_key(|(_, count)| *count);
+
+                match best {
+                    Some(((_, cmd), count)) => {
+                        let title = "Predicted next action".to_string();
+                        let body = format!(
+                            "You usually run '{}' after editing {} ({} times observed)",
+                            cmd, file_path, count
+                        );
+
+                        Some(Insight {
+                            id: None,
+                            created_at: Utc::now(),
+                            trigger_event: event.id,
+                            insight_type: InsightType::Suggestion,
+                            title,
+                            body,
+                            relevance: 0.7,
+                            surfaced: false,
+                            dismissed: false,
+                            file_path: Some(file_path.clone()),
+                            project: event.project.clone(),
+                        })
+                    }
+                    None => None,
+                }
+            }
+        }
     }
 
     /// Detect long debug cycles: same file saved >5 times in 10 minutes with
