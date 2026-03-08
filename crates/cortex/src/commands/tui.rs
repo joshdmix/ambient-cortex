@@ -82,25 +82,10 @@ impl App {
             _ => {}
         }
 
-        // Fetch insights via a query for "." as a proxy (insights come with file queries)
-        // We already have insight_count from status; insights are embedded in query results.
-        // For the TUI we'll show events and status. Insights would need a dedicated endpoint.
-        // We'll populate from search results as a fallback.
-        match send_request(Request::Search {
-            query: "*".to_string(),
-        })
-        .await
-        {
-            Ok(Response::SearchResult(hits)) => {
-                self.insights = hits
-                    .into_iter()
-                    .map(|h| InsightSummary {
-                        title: h.text.clone(),
-                        body: String::new(),
-                        relevance: h.relevance,
-                        insight_type: h.source_type,
-                    })
-                    .collect();
+        // Fetch pending insights
+        match send_request(Request::GetInsights).await {
+            Ok(Response::InsightsResult(ins)) => {
+                self.insights = ins;
             }
             _ => {}
         }
