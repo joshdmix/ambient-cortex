@@ -84,19 +84,13 @@ impl App {
         }
 
         // Fetch history
-        match send_request(Request::History { limit: 100 }).await {
-            Ok(Response::HistoryResult(evts)) => {
-                self.events = evts;
-            }
-            _ => {}
+        if let Ok(Response::HistoryResult(evts)) = send_request(Request::History { limit: 100 }).await {
+            self.events = evts;
         }
 
         // Fetch pending insights
-        match send_request(Request::GetInsights).await {
-            Ok(Response::InsightsResult(ins)) => {
-                self.insights = ins;
-            }
-            _ => {}
+        if let Ok(Response::InsightsResult(ins)) = send_request(Request::GetInsights).await {
+            self.insights = ins;
         }
     }
 

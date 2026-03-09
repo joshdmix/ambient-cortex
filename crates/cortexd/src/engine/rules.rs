@@ -92,7 +92,7 @@ impl LocalRules {
         }
 
         let files_list = strong_pairs.join(", ");
-        let title = format!("You usually edit these files together");
+        let title = "You usually edit these files together".to_string();
         let body = format!(
             "When you change {}, you typically also change: {}",
             file_path, files_list

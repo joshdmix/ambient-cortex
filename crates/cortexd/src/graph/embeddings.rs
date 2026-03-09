@@ -21,6 +21,7 @@ impl EmbeddingEngine {
             .ok_or_else(|| anyhow::anyhow!("embedding returned no results"))
     }
 
+    #[allow(dead_code)]
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let results = self.model.embed(texts.to_vec(), None)?;
         Ok(results)

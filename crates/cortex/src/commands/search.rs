@@ -18,8 +18,8 @@ pub async fn run(query: &str) -> Result<()> {
 
             println!("Search results for \"{}\":\n", query);
             println!(
-                "{:<10} {:<14} {}",
-                "Relevance", "Type", "Text"
+                "{:<10} {:<14} Text",
+                "Relevance", "Type"
             );
             println!("{}", "-".repeat(60));
 

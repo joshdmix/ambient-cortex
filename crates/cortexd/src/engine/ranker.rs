@@ -25,6 +25,7 @@ impl InsightRanker {
     /// Score an insight including an optional semantic similarity factor.
     /// When similarity is provided, it is blended into the score, reducing
     /// the weight of other factors proportionally.
+    #[allow(dead_code)]
     pub fn score_with_similarity(
         &self,
         insight: &Insight,

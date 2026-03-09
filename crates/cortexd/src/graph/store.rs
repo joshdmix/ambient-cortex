@@ -55,7 +55,7 @@ impl Store {
         )?;
 
         let events = stmt
-            .query_map(params![path, limit as i64], |row| event_from_row(row))?
+            .query_map(params![path, limit as i64], event_from_row)?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -90,7 +90,7 @@ impl Store {
         )?;
 
         let result = stmt
-            .query_row(params![path], |row| file_node_from_row(row))
+            .query_row(params![path], file_node_from_row)
             .ok();
 
         Ok(result)
@@ -202,7 +202,7 @@ impl Store {
         )?;
 
         let insights = stmt
-            .query_map([], |row| insight_from_row(row))?
+            .query_map([], insight_from_row)?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -230,7 +230,7 @@ impl Store {
         )?;
 
         let events = stmt
-            .query_map(params![limit as i64], |row| event_from_row(row))?
+            .query_map(params![limit as i64], event_from_row)?
             .filter_map(|r| r.ok())
             .collect();
 

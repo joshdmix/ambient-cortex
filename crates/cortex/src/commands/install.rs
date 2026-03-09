@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn run() -> Result<()> {
     let data_dir = dirs::data_local_dir()
@@ -256,7 +256,7 @@ fn find_git_repos(dirs: &[PathBuf]) -> Vec<PathBuf> {
     repos
 }
 
-fn install_git_hooks(repo_path: &PathBuf) -> Result<()> {
+fn install_git_hooks(repo_path: &Path) -> Result<()> {
     let hooks_dir = repo_path.join(".git").join("hooks");
     if !hooks_dir.exists() {
         fs::create_dir_all(&hooks_dir)?;
@@ -308,7 +308,7 @@ printf '{{"type":"git_checkout","prev_head":"%s","new_head":"%s","branch":"%s","
     Ok(())
 }
 
-fn write_hook(hook_path: &PathBuf, script: &str, repo_path: &PathBuf) -> Result<()> {
+fn write_hook(hook_path: &Path, script: &str, repo_path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let hook_name = hook_path

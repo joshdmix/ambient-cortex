@@ -14,8 +14,8 @@ pub async fn run(limit: usize) -> Result<()> {
             }
 
             println!(
-                "{:<20} {:<14} {:<12} {}",
-                "Timestamp", "Type", "Source", "Summary"
+                "{:<20} {:<14} {:<12} Summary",
+                "Timestamp", "Type", "Source"
             );
             println!("{}", "-".repeat(70));
 

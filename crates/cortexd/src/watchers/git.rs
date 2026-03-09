@@ -41,7 +41,7 @@ fn get_head_info(repo: &git2::Repository) -> (Option<git2::Oid>, Option<String>)
     let oid = repo
         .head()
         .ok()
-        .map(|r| r.target().unwrap_or_else(|| git2::Oid::zero()));
+        .map(|r| r.target().unwrap_or_else(git2::Oid::zero));
     let branch = repo
         .head()
         .ok()

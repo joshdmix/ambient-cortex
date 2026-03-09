@@ -30,8 +30,8 @@ pub async fn run(file_path: &str) -> Result<()> {
             if !info.recent_events.is_empty() {
                 println!("\n  Recent events:");
                 println!(
-                    "    {:<20} {:<14} {:<12} {}",
-                    "Timestamp", "Type", "Source", "Summary"
+                    "    {:<20} {:<14} {:<12} Summary",
+                    "Timestamp", "Type", "Source"
                 );
                 for event in &info.recent_events {
                     println!(
